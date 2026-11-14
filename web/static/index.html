@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en-GB" data-theme="system">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mornye Web</title>
+<meta name="description" content="Mornye in the browser: search, queue and download music with the same backend and extensions as the app.">
+<meta name="theme-color" content="#F6F4EF">
+<link rel="icon" href="mark.svg">
+<script>try{var t=localStorage.getItem('m.theme');if(t)document.documentElement.dataset.theme=t}catch(e){}document.documentElement.classList.add('m-js')</script>
+<link rel="stylesheet" href="m/m.css">
+<link rel="preload" href="m/fonts/gsf.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="m/fonts/sym.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="m/fonts/brico.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="app.css">
+<script type="module" src="app.js"></script>
+</head>
+<body class="mo">
+<a class="skip" href="#mo-main">Skip to the content</a>
+
+<header class="hdr">
+  <a class="brand" href="#search"><svg viewBox="29 22 42 52" aria-hidden="true"><path d="M50 27V68M38 57L50 69L62 57M35 36V46M65 36V46"/></svg><b>mornye</b><span>web</span></a>
+  <nav class="nav" data-pill aria-label="Places" id="mo-nav">
+    <a href="#search" aria-current="page">Search</a>
+    <a href="#queue">Queue <span class="badge" data-queue-count hidden>0</span></a>
+    <a href="#library">Library</a>
+    <a href="#extensions">Extensions</a>
+    <a href="#settings">Settings</a>
+  </nav>
+  <div class="hdr-end">
+    <span class="status hide-phone" id="mo-backend" role="status"><i class="dot breathe"></i>Starting</span>
+    <button class="ib menu-btn" type="button" data-open="mo-menu" aria-label="Menu"><span class="ms">menu</span></button>
+  </div>
+</header>
+<dialog class="sheet" id="mo-menu" data-side="left" aria-labelledby="mo-menu-h">
+  <div class="sheet-head"><h2 id="mo-menu-h">Mornye</h2><button class="ib" type="button" data-close aria-label="Close"><span class="ms">close</span></button></div>
+  <div class="sheet-body"><nav class="sheet-nav" aria-label="Places in the menu" id="mo-menu-nav">
+    <a href="#search" data-close aria-current="page">Search</a>
+    <a href="#queue" data-close>Queue <span class="badge" data-queue-count hidden>0</span></a>
+    <a href="#library" data-close>Library</a>
+    <a href="#extensions" data-close>Extensions</a>
+    <a href="#settings" data-close>Settings</a>
+  </nav></div>
+</dialog>
+
+<main class="page" id="mo-main">
+
+  <!-- Search: words or a link in, tracks and collections out -->
+  <section class="panel tight" data-view="search" aria-labelledby="mo-search-h">
+    <div class="in stack fill mo-view">
+      <h1 class="vh" id="mo-search-h">Search</h1>
+      <form class="search-form" role="search" aria-label="Music" id="mo-search">
+        <div class="field search paper" data-size="lg">
+          <span class="ms">search</span>
+          <input type="search" name="q" id="mo-q" aria-label="Search, or paste a link" placeholder="A song, an album, an artist, or a link" data-key="/" autocomplete="off" spellcheck="false">
+          <button class="ib" type="button" data-clear aria-label="Clear the search"><span class="ms">close</span></button>
+          <kbd>/</kbd>
+        </div>
+      </form>
+      <div class="cluster between mo-bar">
+        <div class="cluster" id="mo-search-opts"></div>
+        <div class="cluster" id="mo-download-opts"></div>
+      </div>
+      <div id="mo-results" class="stack fill mo-results"></div>
+    </div>
+  </section>
+
+  <!-- Queue: what is on its way -->
+  <section class="panel tight" data-view="queue" aria-labelledby="mo-queue-h" hidden>
+    <div class="in stack fill mo-view">
+      <div class="cluster between">
+        <h1 class="h3" id="mo-queue-h">Queue</h1>
+        <div class="cluster">
+          <button class="btn" data-size="sm" type="button" data-act="queue-retry"><span class="ms">replay</span>Retry failed</button>
+          <button class="btn" data-size="sm" type="button" data-act="queue-clear"><span class="ms">done_all</span>Clear finished</button>
+          <button class="btn" data-size="sm" data-variant="danger" type="button" data-act="queue-cancel"><span class="ms">cancel</span>Cancel all</button>
+        </div>
+      </div>
+      <div class="stats mo-stats" id="mo-queue-stats" style="--n: 4">
+        <div class="stat"><b data-stat="downloading">0</b><span>downloading</span></div>
+        <div class="stat"><b data-stat="queued">0</b><span>waiting</span></div>
+        <div class="stat"><b data-stat="completed">0</b><span>done</span></div>
+        <div class="stat"><b data-stat="failed">0</b><span>failed</span></div>
+      </div>
+      <div id="mo-queue"></div>
+    </div>
+  </section>
+
+  <!-- Library: what has been downloaded -->
+  <section class="panel tight" data-view="library" aria-labelledby="mo-library-h" hidden>
+    <div class="in stack fill mo-view">
+      <div class="cluster between">
+        <h1 class="h3" id="mo-library-h">Library</h1>
+        <form class="search-form mo-filter" role="search" aria-label="The library" onsubmit="return false">
+          <div class="field search" data-size="sm"><span class="ms">search</span><input type="search" id="mo-library-q" aria-label="Filter the library" placeholder="Filter" autocomplete="off"><button class="ib" type="button" data-clear aria-label="Clear the filter"><span class="ms">close</span></button></div>
+        </form>
+      </div>
+      <div id="mo-library"></div>
+    </div>
+  </section>
+
+  <!-- Extensions: where search and downloads come from -->
+  <section class="panel tight" data-view="extensions" aria-labelledby="mo-ext-h" hidden>
+    <div class="in stack fill mo-view">
+      <h1 class="h3" id="mo-ext-h">Extensions</h1>
+      <m-tabs id="mo-ext-tabs">
+        <div class="tabs" role="tablist" aria-label="Extensions">
+          <button role="tab" aria-selected="true">Installed <span class="badge" id="mo-ext-n" hidden>0</span></button>
+          <button role="tab">Repository</button>
+          <button role="tab">Order</button>
+        </div>
+        <div role="tabpanel" class="mo-tab"><div id="mo-installed"></div></div>
+        <div role="tabpanel" class="mo-tab">
+          <div class="stack fill">
+            <form class="mo-repo" id="mo-repo-form">
+              <label class="label" for="mo-repo-url">Repository</label>
+              <div class="cluster mo-repo-row">
+                <div class="field grow"><span class="ms">link</span><input id="mo-repo-url" name="url" type="url" inputmode="url" placeholder="https://github.com/owner/repository" autocomplete="off" spellcheck="false"></div>
+                <button class="btn" data-variant="ink" type="submit">Use it</button>
+                <button class="btn" type="button" data-act="repo-refresh" data-tip="Read the repository again"><span class="ms">refresh</span>Refresh</button>
+              </div>
+              <span class="help">A GitHub repository holding a <code>registry.json</code>, or a direct link to one. Anyone can host one; Mornye ships none.</span>
+            </form>
+            <div id="mo-repo"></div>
+            <div class="cluster">
+              <label class="btn" data-variant="outline"><span class="ms">upload_file</span>Install from a file<input type="file" id="mo-ext-file" accept=".mornye-ext,.sflx,.zip" hidden></label>
+            </div>
+          </div>
+        </div>
+        <div role="tabpanel" class="mo-tab"><div id="mo-order" class="cols-2 mo-order"></div></div>
+      </m-tabs>
+    </div>
+  </section>
+
+  <!-- Settings: how a download is made -->
+  <section class="panel tight" data-view="settings" aria-labelledby="mo-settings-h" hidden>
+    <div class="in stack fill mo-view">
+      <h1 class="h3" id="mo-settings-h">Settings</h1>
+      <form class="form mo-settings" id="mo-settings" onsubmit="return false"></form>
+    </div>
+  </section>
+</main>
+
+<!-- One extension's settings -->
+<dialog class="dialog wide" id="mo-ext-dialog" aria-labelledby="mo-ext-dialog-h">
+  <div class="dialog-head"><h2 id="mo-ext-dialog-h">Extension</h2><button class="ib" type="button" data-close aria-label="Close"><span class="ms">close</span></button></div>
+  <form class="form" id="mo-ext-form" onsubmit="return false">
+    <div class="dialog-body stack fill" id="mo-ext-fields"></div>
+    <div class="dialog-foot"><button class="btn" data-variant="text" type="button" data-close>Close</button><button class="btn" data-variant="ink" type="submit" id="mo-ext-save">Save</button></div>
+  </form>
+</dialog>
+
+<!-- Signing in to a service an extension uses -->
+<dialog class="dialog" id="mo-auth-dialog" aria-labelledby="mo-auth-h" aria-describedby="mo-auth-d">
+  <div class="dialog-head"><h2 id="mo-auth-h">Sign in to continue</h2><button class="ib" type="button" data-close aria-label="Close"><span class="ms">close</span></button></div>
+  <form class="form" id="mo-auth-form" onsubmit="return false">
+    <div class="dialog-body stack fill">
+      <p class="muted" id="mo-auth-d">This extension needs you to verify with its service before it can go on.</p>
+      <ol class="mo-steps">
+        <li><a class="btn" data-variant="ink" id="mo-auth-open" target="_blank" rel="noopener noreferrer"><span class="ms">open_in_new</span>Open the sign-in page</a></li>
+        <li>When it finishes it sends you to a link that begins <code>mornye://</code>, which a browser cannot open. Copy that link.</li>
+        <li><div class="formrow"><label class="label" for="mo-auth-url">Paste the link here</label><div class="field"><span class="ms">link</span><input id="mo-auth-url" name="url" placeholder="mornye://session-grant?…" autocomplete="off" spellcheck="false" required></div></div></li>
+      </ol>
+    </div>
+    <div class="dialog-foot"><button class="btn" data-variant="text" type="button" data-close>Not now</button><button class="btn" data-variant="ink" type="submit">Finish signing in</button></div>
+  </form>
+</dialog>
+
+<!-- Asked before anything is thrown away -->
+<dialog class="dialog" data-variant="confirm" id="mo-confirm" aria-labelledby="mo-confirm-h" aria-describedby="mo-confirm-d">
+  <div class="dialog-head"><span class="dialog-icon" data-tone="danger"><span class="ms">delete</span></span><h2 id="mo-confirm-h">Remove?</h2></div>
+  <div class="dialog-body"><p class="muted" id="mo-confirm-d"></p></div>
+  <div class="dialog-foot"><button class="btn" type="button" data-close>Keep it</button><button class="btn" data-variant="danger-ink" type="button" data-close="yes" id="mo-confirm-yes">Remove</button></div>
+</dialog>
+
+</body>
+</html>
