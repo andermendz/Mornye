@@ -336,7 +336,7 @@ DEFAULTS = {
     'service': '',                      # '' is the first enabled download extension
     'quality': 'LOSSLESS',
     'auto_fallback': True,
-    'concurrent_downloads': 1,
+    'concurrent_downloads': 1,          # as the app: every download costs lookups that services ration, and three at once spends them three times as fast
     'embed_metadata': True,
     'embed_lyrics': True,
     'lyrics_mode': 'embed',
@@ -344,6 +344,7 @@ DEFAULTS = {
     'artist_tag_mode': 'joined',
     'songlink_region': 'US',
     'deduplicate': True,
+    'playlist_folder': True,            # a playlist's songs go in a folder of its name, the chosen folders inside it
     'download_priority': [],
     'metadata_priority': [],
     'fallback_ids': None,               # None lets every download extension stand in; a list names the ones that may
@@ -375,9 +376,15 @@ def number(source, key):
         return 0
 
 
-def safe_name(value):
+def safe_name(value, empty='Unknown'):
     """A folder name any filesystem takes (the app's sanitizer: forbidden characters become spaces, empty is Unknown)."""
-    return re.sub(r'\s+', ' ', re.sub(r'[<>:"/\\|?*\x00-\x1f]', ' ', value)).strip(' .') or 'Unknown'
+    return re.sub(r'\s+', ' ', re.sub(r'[<>:"/\\|?*\x00-\x1f]', ' ', value)).strip(' .') or empty
+
+
+def lossless(extension):
+    """Whether a download extension offers lossless audio, by what its quality options say of themselves."""
+    return any(text(q, 'kind') == 'lossless' or re.search(r'flac|lossless|hi.?res', f"{text(q, 'id')} {text(q, 'label')}", re.I)
+               for q in extension.get('quality_options') or [])
 
 
 def output_ext(quality, extension):
@@ -425,8 +432,15 @@ class App:
         self.hub = Hub()
         self.settings = Store(self.dir / 'settings.json', {})
         self.history = Store(self.dir / 'history.json', [])
-        # ponytail: the queue lives in memory; a restart drops what was waiting. Persist it beside history.json if that hurts.
+        self.saved = Store(self.dir / 'queue.json', [])
         self.items, self.progress, self.extensions = {}, {}, []
+        for item in self.saved.data:   # the queue outlives the server; what was in flight when it stopped starts again
+            if item.get('status') in ('downloading', 'finalizing'):
+                item['status'] = 'queued'
+            self.items[item['id']] = item
+        self.dirty, self.paused, self.cool_until, self.hold_reason, self.streak = False, False, 0, '', 0
+        self.needs_signin = set()   # stand-in services that asked for a sign-in: left out of fallback until signed in to
+        self.item_logs = {}   # id -> the backend's log lines from that download's last attempt (memory only: they are large)
         self.lock = threading.RLock()
         self.wake = threading.Condition(self.lock)
         self.seq = itertools.count(1)
@@ -438,7 +452,8 @@ class App:
         self.actions = {
             '/api/settings': self.update_settings, '/api/queue/add': self.add, '/api/queue/cancel': self.cancel,
             '/api/queue/retry': self.retry, '/api/queue/clear': self.clear, '/api/history/remove': self.forget,
-            '/api/extensions/install': self.install, '/api/priority': self.set_priority,
+            '/api/extensions/install': self.install, '/api/priority': self.set_priority, '/api/queue/pause': self.pause,
+            '/api/queue/detail': self.detail, '/api/diagnose': self.diagnose,
         }
         threading.Thread(target=self.dispatch, daemon=True).start()
 
@@ -466,12 +481,14 @@ class App:
         call('loadExtensionsFromDir', {'dir_path': str(self.dir / 'extensions')}, 120)
         call('initExtensionRepo', {'cache_dir': str(self.dir / 'repo')}, 60)
         call('setDownloadDirectory', {'path': folder}, 30)
+        call('setLoggingEnabled', {'enabled': True}, 30)   # the extensions say what they tried; without this nobody hears it
         # the backend keeps these in memory only; the app re-applies them from its settings at every start
         for name, method in (('download_priority', 'setProviderPriority'), ('metadata_priority', 'setMetadataProviderPriority')):
             if self.setting(name):
                 call(method, {'priority': json.dumps(self.setting(name))}, 30)
-        if self.setting('fallback_ids') is not None:
-            call('setDownloadFallbackExtensionIds', {'extension_ids': json.dumps(self.setting('fallback_ids'))}, 30)
+        self.installed()
+        self.apply_fallback()
+        self.sync_priority()
 
     def installed(self):
         self.extensions = self.backend.call('getInstalledExtensions', None, 60) or []
@@ -480,6 +497,35 @@ class App:
     def extension(self, extension_id):
         wanted = extension_id.lower()
         return next((e for e in self.extensions if text(e, 'id').lower() == wanted), None) if wanted else None
+
+    def sync_priority(self):
+        """The backend falls back only along its priority lists, and they start empty: without this "try other services"
+        tries nobody. Every enabled provider is kept on its list; new ones join at the end, lossless downloaders first."""
+        lists = {}
+        for kind, flag, get, put in (('download', 'has_download_provider', 'getProviderPriority', 'setProviderPriority'),
+                                     ('metadata', 'has_metadata_provider', 'getMetadataProviderPriority', 'setMetadataProviderPriority')):
+            able = [e for e in self.extensions if e.get('enabled') and e.get(flag)]
+            if kind == 'download':
+                able.sort(key=lambda e: not lossless(e))
+            current = self.backend.call(get, None, 30) or []
+            have = {i.lower() for i in current}
+            wanted = current + [e['id'] for e in able if e['id'].lower() not in have]
+            if wanted != current:
+                self.backend.call(put, {'priority': json.dumps(wanted)}, 30)
+                current = self.backend.call(get, None, 30) or []
+            lists[kind] = current
+        return lists
+
+    def apply_fallback(self):
+        """Who may stand in for the chosen service: the ones Settings allows, less the ones waiting for a sign-in.
+        (The backend stops a download outright at the first stand-in that wants one.)"""
+        allowed = self.setting('fallback_ids')
+        if allowed is None and not self.needs_signin:
+            return self.backend.call('setDownloadFallbackExtensionIds', {'extension_ids': ''}, 30)
+        if allowed is None:
+            allowed = [text(e, 'id') for e in self.extensions if e.get('enabled') and e.get('has_download_provider')]
+        skip = {i.lower() for i in self.needs_signin}
+        self.backend.call('setDownloadFallbackExtensionIds', {'extension_ids': json.dumps([i for i in allowed if i.lower() not in skip])}, 30)
 
     def default_service(self):
         """extension_provider_priority.dart: the chosen service if it can still download, else the first that can."""
@@ -492,12 +538,11 @@ class App:
         return able[0] if able else ''
 
     def state(self):
-        call = self.backend.call
         return {
             'settings': {**DEFAULTS, **self.settings.data}, 'download_dir': self.download_dir(),
             'queue': list(self.items.values()), 'progress': self.progress, 'history': self.history.data,
-            'service': self.default_service(), 'extensions': self.extensions,
-            'priority': {'download': call('getProviderPriority', None, 30) or [], 'metadata': call('getMetadataProviderPriority', None, 30) or []},
+            'service': self.default_service(), 'extensions': self.extensions, 'hold': self.hold(), 'signin': sorted(self.needs_signin),
+            'priority': self.sync_priority(),
             'about': {'version': APP_VERSION, 'library': str(self.library), 'data': str(self.dir), 'ffmpeg': bool(self.ffmpeg and self.ffprobe)},
         }
 
@@ -515,8 +560,7 @@ class App:
             os.makedirs(self.download_dir(), exist_ok=True)
             self.backend.call('setDownloadDirectory', {'path': self.download_dir()}, 30)
         if 'fallback_ids' in cleaned:
-            ids = cleaned['fallback_ids']
-            self.backend.call('setDownloadFallbackExtensionIds', {'extension_ids': '' if ids is None else json.dumps(ids)}, 30)
+            self.apply_fallback()
         with self.wake:
             self.wake.notify_all()   # more may run at once now
         return {**DEFAULTS, **self.settings.data}
@@ -567,13 +611,39 @@ class App:
             if data.get('method') == 'extensionAuthCallbackReceived':   # not on Rust's thread: it is waiting for us
                 threading.Thread(target=lambda: self.backend.call('processPendingExtensionCallbacks', None, 300), daemon=True).start()
             elif data.get('method') == 'extensionSessionGrantCompleted':
-                self.hub.publish('auth', data.get('arguments') or {})
+                grant = data.get('arguments') or {}
+                if grant.get('success'):   # signed in: it may stand in again
+                    self.needs_signin = {i for i in self.needs_signin if i.lower() != str(grant.get('extension_id')).lower()}
+                    threading.Thread(target=self.signin_changed, daemon=True).start()
+                self.hub.publish('auth', grant)
 
     # ── the queue ──
 
     def change(self, item, **fields):
         item.update(fields)
+        self.dirty = True
         self.hub.publish('queue', item)
+
+    # ── holding the queue: by hand, or by itself when a run of failures says the services have stopped answering ──
+
+    def hold(self):
+        cooling = self.cool_until > time.time()
+        return {'paused': self.paused, 'cool_until': self.cool_until if cooling else 0, 'reason': self.hold_reason if cooling else ''}
+
+    def pause(self, body):
+        with self.wake:
+            self.paused, self.cool_until, self.streak = body.get('paused') is True, 0, 0
+            self.wake.notify_all()
+        self.hub.publish('hold', self.hold())
+        return self.hold()
+
+    def persist(self):
+        self.dirty = False
+        try:
+            self.saved.data = list(self.items.values())
+            self.saved.save()
+        except (RuntimeError, OSError):   # an item changed under the writer, or the disk said no: the next pass writes it
+            self.dirty = True
 
     def identities(self, track):
         name = f"{text(track, 'name')}|{text(track, 'artists')}".lower()
@@ -603,9 +673,11 @@ class App:
                 self.items[item_id] = item = {
                     'id': item_id, 'track': track, 'service': service, 'quality': quality, 'playlist_name': playlist,
                     'playlist_position': number(track, 'playlist_position') or (index + 1 if playlist else 0),
+                    'group': text(body, 'group') or playlist,
                     'from_batch': batch, 'status': 'queued', 'error': '', 'error_type': '', 'added_at': time.time(),
                     'retried': False, 'not_before': 0}
                 added.append(item)
+            self.dirty = True
             self.wake.notify_all()
         for item in added:
             self.hub.publish('queue', item)
@@ -641,6 +713,7 @@ class App:
             gone = [i['id'] for i in self.items.values() if i['status'] in ('completed', 'failed', 'skipped')]
             for item_id in gone:
                 del self.items[item_id]
+            self.dirty = True
         self.hub.publish('queue-remove', gone)
         return len(gone)
 
@@ -649,12 +722,14 @@ class App:
         while True:
             with self.wake:
                 while True:
+                    if self.dirty:
+                        self.persist()
                     running = sum(i['status'] in ('downloading', 'finalizing') for i in self.items.values())
                     item = next((i for i in self.items.values() if i['status'] == 'queued' and i['not_before'] <= time.time()), None)
-                    if item and running < self.setting('concurrent_downloads'):
+                    if item and running < self.setting('concurrent_downloads') and not self.paused and time.time() >= self.cool_until:
                         break
                     self.wake.wait(1)
-                item['status'] = 'downloading'
+                item['status'], self.dirty = 'downloading', True
             self.hub.publish('queue', item)
             threading.Thread(target=self.run, args=(item,), daemon=True).start()
 
@@ -672,8 +747,10 @@ class App:
     def output_dir(self, item):
         track = item['track']
         artist, album = safe_name(text(track, 'album_artist') or text(track, 'artists')), safe_name(text(track, 'album_name'))
-        parts = {'artist': [artist], 'album': [album], 'artist_album': [artist, album],
-                 'playlist': [safe_name(item['playlist_name'])] if item['playlist_name'] else []}.get(self.setting('folder_organization'), [])
+        kind = self.setting('folder_organization')
+        parts = {'artist': [artist], 'album': [album], 'artist_album': [artist, album]}.get(kind, [])
+        if item['playlist_name'] and (kind == 'playlist' or self.setting('playlist_folder')):
+            parts = [safe_name(item['playlist_name'], 'Playlist')] + parts
         return str(Path(self.download_dir(), *parts))
 
     def request(self, item, folder):
@@ -710,11 +787,74 @@ class App:
             'network_concurrency_limit': max(1, min(3, number(transfer, 'maxConcurrentDownloads') or 3)),
         }
 
+    # ── what happened, in detail ──
+
+    def log_cursor(self):
+        try:
+            return (self.backend.call('getLogsSince', {'index': 1 << 60}, 30) or {}).get('next_index', 0)
+        except BackendError:
+            return 0
+
+    def keep_log(self, item, cursor):
+        """The backend's lines since this attempt began. With several downloads at once their lines interleave."""
+        try:
+            lines = (self.backend.call('getLogsSince', {'index': cursor}, 30) or {}).get('logs') or []
+        except BackendError:
+            lines = []
+        self.item_logs[item['id']] = lines[-400:]
+        tried = [text(line, 'message')[:300] for line in lines if text(line, 'tag') == 'DownloadPlanner']
+        item.update(trail=tried[-12:], finished_at=time.time())
+        while len(self.item_logs) > 600:   # the oldest go first
+            self.item_logs.pop(next(iter(self.item_logs)))
+
+    def detail(self, body):
+        item = self.items[str(body['id'])]
+        try:
+            request = self.request(item, self.output_dir(item))
+        except Exception as error:
+            request = {'error': str(error)}
+        return {'item': item, 'request': request, 'log': self.item_logs.get(item['id'], [])}
+
+    def diagnose(self, body):
+        """One report of everything that decides whether a download can work."""
+        import collections
+        import platform
+        checks = []
+        for extension in self.installed():
+            if not (extension.get('enabled') and extension.get('has_download_provider')):
+                continue
+            started = time.time()
+            try:
+                health = self.backend.call('checkExtensionHealth', {'extension_id': extension['id']}, 45)
+                checks.append({'id': extension['id'], 'name': extension.get('display_name'), 'version': extension.get('version'), 'ok': True, 'health': health, 'seconds': round(time.time() - started, 1)})
+            except BackendError as error:
+                checks.append({'id': extension['id'], 'name': extension.get('display_name'), 'version': extension.get('version'), 'ok': False, 'error': error.message, 'seconds': round(time.time() - started, 1)})
+        items = list(self.items.values())
+        return {
+            'when': time.strftime('%Y-%m-%d %H:%M:%S'), 'server': {'python': platform.python_version(), 'system': platform.platform(), **self.state()['about']},
+            'settings': {**DEFAULTS, **self.settings.data}, 'service': self.default_service(), 'hold': self.hold(),
+            'queue': dict(collections.Counter(i['status'] for i in items)),
+            'errors': [{'count': n, 'type': kind, 'error': message} for (kind, message), n in collections.Counter((i['error_type'], i['error']) for i in items if i['status'] == 'failed').most_common(12)],
+            'extensions': [{'id': e['id'], 'version': e.get('version'), 'enabled': e.get('enabled'), 'status': e.get('status'), 'error': e.get('error_message', '')} for e in self.extensions],
+            'checks': checks,
+        }
+
     def download(self, item):
         self.installed()
+        self.sync_priority()
+        cursor = self.log_cursor()
+        item.update(started_at=time.time(), finished_at=0, attempts=item.get('attempts', 0) + 1, trail=[])
+        try:
+            self.attempt(item)
+        finally:
+            self.keep_log(item, cursor)
+            self.dirty = True
+
+    def attempt(self, item):
         folder = self.output_dir(item)
         os.makedirs(folder, exist_ok=True)
         request = self.request(item, folder)
+        item['folder'] = folder
         grant = self.backend.call('acquireDownloadDirectory', {'path': folder}, 60)
         try:
             result = self.backend.call('downloadByStrategy', json.dumps(request))   # the request travels as JSON text
@@ -729,8 +869,13 @@ class App:
                 self.backend.call('releaseDownloadDirectory', {'token': grant or ''}, 60)
             except BackendError:
                 pass
+        self.streak = 0
         entry = self.remember(item, result, path)
         self.change(item, status='completed', error='', error_type='', file_path=path, history_id=entry['id'])
+
+    def signin_changed(self):
+        self.apply_fallback()
+        self.hub.publish('signin', sorted(self.needs_signin))
 
     def failed(self, item, result):
         kind = text(result, 'error_type') or 'unknown'
@@ -739,11 +884,24 @@ class App:
             return self.change(item, status='skipped', error='Cancelled', error_type='cancelled')
         if any(mark in message.lower() for mark in VERIFY):
             kind = 'verification_required'
+        asking = re.search(r"extension '([^']+)'", message)
+        if kind == 'verification_required' and asking and asking.group(1).lower() != item['service'].lower() and asking.group(1) not in self.needs_signin:
+            # a stand-in wants a sign-in. That is not this song failing: leave that service out and go on to the next.
+            self.needs_signin.add(asking.group(1))
+            self.signin_changed()
+            with self.wake:
+                self.change(item, status='queued', error=f'{asking.group(1)} needs a sign-in: trying the other services', error_type='')
+            return
         if kind == 'rate_limit' and not item['retried']:   # the app's one automatic retry
             wait = max(5, min(300, number(result, 'retry_after_seconds') or 30))
             with self.wake:
                 self.change(item, status='queued', retried=True, not_before=time.time() + wait, error=f'Rate limited: trying again in {wait} s', error_type=kind)
             return
+        self.streak += 1
+        if self.streak >= 5:   # one song missing is the song; five in a row is the lookups being refused: stop spending the queue on it
+            self.streak, self.cool_until = 0, time.time() + 600
+            self.hold_reason = 'Five downloads in a row failed, which usually means a lookup service is refusing requests for now. Retry the failed ones once it lifts.'
+            self.hub.publish('hold', self.hold())
         found = re.search(r"extension '([^']+)'", message)
         self.change(item, status='failed', error=message, error_type=kind, auth_extension=found.group(1) if found else text(result, 'service'))
         try:
@@ -923,6 +1081,8 @@ def check():
         raise AssertionError('an unknown setting was accepted')
     except KeyError:
         pass
+    assert lossless({'quality_options': [{'id': 'flac'}]}) and lossless({'quality_options': [{'id': 'best', 'kind': 'lossless'}]})
+    assert not lossless({'quality_options': [{'id': 'AAC_320', 'kind': 'lossy'}]}) and not lossless({})
     assert 'downloadByStrategy' not in PASSTHROUGH and 'editFileMetadata' not in PASSTHROUGH   # those take server paths
     print('ok')
 

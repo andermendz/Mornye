@@ -23,7 +23,8 @@ const S = {
   search: { source: '', filter: 'track', view: null },   // view: what the results area shows, kept so Back comes home to it
   rows: [],                                              // the tracks and collections on screen, by index
 };
-const VIEWS = ['search', 'queue', 'library', 'extensions', 'settings'];
+const VIEWS = ['search', 'queue', 'library', 'extensions', 'settings', 'logs'];
+S.qfilter = 'all'; S.collapsed = new Set(); S.report = '';
 
 /* ════════ errors: said once, plainly; a sign-in when that is what is missing ════════ */
 function fail(error) {
@@ -40,7 +41,7 @@ const nameOf = id => S.extensions.find(e => e.id.toLowerCase() === String(id).to
 async function load() {
   const state = await (await fetch('/api/state')).json();
   if (state.error) throw new Error(state.error);
-  Object.assign(S, { settings: state.settings, progress: state.progress || {}, history: state.history, extensions: state.extensions, priority: state.priority, about: state.about, service: state.service, downloadDir: state.download_dir });
+  Object.assign(S, { settings: state.settings, progress: state.progress || {}, history: state.history, extensions: state.extensions, priority: state.priority, about: state.about, service: state.service, downloadDir: state.download_dir, hold: state.hold, signin: state.signin || [] });
   S.queue = new Map(state.queue.map(item => [item.id, item]));
   renderAll();
 }
@@ -78,6 +79,8 @@ function listen() {
     if (change.remove) S.history = S.history.filter(h => !change.remove.includes(h.id));
     renderLibrary();
   });
+  events.addEventListener('hold', e => { S.hold = JSON.parse(e.data); paintHold(); });
+  events.addEventListener('signin', e => { S.signin = JSON.parse(e.data); paintHold(); });
   events.addEventListener('auth', e => {
     const grant = JSON.parse(e.data);
     if (grant.success) { toast(`Signed in to ${nameOf(grant.extension_id)}`, { icon: 'check' }); retryVerification(); }
@@ -94,6 +97,7 @@ function route() {
   if (link) setCurrent(link);
   $$('#mo-menu-nav a').forEach(a => (a.getAttribute('href') === '#' + name ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current')));
   document.title = `${name[0].toUpperCase()}${name.slice(1)} · Mornye Web`;
+  if (name === 'logs') tailLogs();
   if (name !== 'search') return;
   if (kind && provider && rest.length) openCollection(kind, decodeURIComponent(provider), decodeURIComponent(rest.join('/'))).catch(fail);
   else {
@@ -262,10 +266,10 @@ function renderCollection(view) {
 }
 
 /* ── into the queue ── */
-async function enqueue(tracks, playlist = '') {
+async function enqueue(tracks, playlist = '', group = playlist) {
   if (!tracks.length) return;
   try {
-    const result = await post('/api/queue/add', { tracks, service: S.service, quality: $('#mo-quality')?.value || S.settings.quality, playlist_name: playlist });
+    const result = await post('/api/queue/add', { tracks, service: S.service, quality: $('#mo-quality')?.value || S.settings.quality, playlist_name: playlist, group });
     const detail = result.skipped ? `${result.skipped} already here or waiting` : undefined;
     toast(result.added ? `${plural(result.added, 'song')} added to the queue` : 'Already here', { icon: result.added ? 'download' : 'check', detail, action: 'Queue', onAction: () => { location.hash = '#queue'; } });
   } catch (error) { fail(error); }
@@ -278,7 +282,7 @@ async function enqueueAlbums(view) {
       const info = data.album_info || data;
       const from = { provider_id: album.provider_id, cover_url: web(info.cover_url) || web(info.images) || album.cover_url, album_name: info.name || album.name, album_artist: info.artists || album.artists,
         release_date: info.release_date || album.release_date, album_type: info.album_type || album.album_type, total_tracks: info.total_tracks || album.total_tracks };
-      await post('/api/queue/add', { tracks: (data.track_list || data.tracks || []).map(t => norm(t, from)), service: S.service, quality: $('#mo-quality')?.value || S.settings.quality });
+      await post('/api/queue/add', { tracks: (data.track_list || data.tracks || []).map(t => norm(t, from)), service: S.service, quality: $('#mo-quality')?.value || S.settings.quality, group: view.name });
     } catch (error) { fail(error); }
   }
   toast('The discography is in the queue', { icon: 'download', action: 'Queue', onAction: () => { location.hash = '#queue'; } });
@@ -314,7 +318,7 @@ function queueRow(item) {
       : item.history_id ? `<a class="ib" href="/api/file?id=${esc(item.history_id)}" download data-tip="Save to this device" aria-label="Save ${esc(t.name)} to this device">${ms('save')}</a>` : '';
   return `<li data-id="${id}"><div class="item">${cover ? `<img class="thumb" src="${esc(cover)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : `<span class="lead-i">${ms('headphones')}</span>`}
     <span class="txt"><b>${esc(t.name)}</b><span>${esc([t.artists, nameOf(item.service), item.quality].filter(Boolean).join(' · '))}</span>${bar}${note}</span>
-    <span class="end"><span class="status"><i class="dot ${dot}"></i><span>${esc(words)}</span></span>${acts}</span></div></li>`;
+    <span class="end"><span class="status"><i class="dot ${dot}"></i><span>${esc(words)}</span></span>${acts}<button class="ib" type="button" data-detail="${id}" data-tip="What happened" aria-label="What happened to ${esc(t.name)}">${ms('info')}</button></span></div></li>`;
 }
 const queueRowOf = id => $$('#mo-queue li[data-id]').find(li => li.dataset.id === id);
 function paintProgress(id) {
@@ -334,12 +338,112 @@ function paintQueueCounts() {
   const nav = $('#mo-nav'), was = $('[data-queue-count]', nav).hidden;
   $$('[data-queue-count]').forEach(badge => { badge.textContent = going; badge.hidden = !going; });
   if (was !== !going) movePill(nav, $('[aria-current]', nav), true);   // the link changed width under its pill
+  paintGroups();
 }
+let holdTimer = 0;
+function paintHold() {   // paused by hand, or by the server after a run of failures
+  const hold = S.hold || {}, held = hold.paused || hold.cool_until > 0;
+  $('#mo-pause').innerHTML = held ? `${ms('play_arrow')}Resume` : `${ms('pause')}Pause`;
+  const until = hold.cool_until ? new Date(hold.cool_until * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '';
+  const asking = S.signin || [];
+  $('#mo-hold').innerHTML = (!held ? '' : `<div class="banner" data-tone="warn" role="status">${ms('pause')}<p><b>${hold.paused ? 'The queue is paused.' : `Paused until ${until}.`}</b> ${esc(hold.reason || 'Nothing new starts until you resume.')}</p></div>`)
+    + (!asking.length ? '' : `<div class="callout">${ms('lock')}<div><b>${esc(asking.map(nameOf).join(', '))} ${asking.length === 1 ? 'needs' : 'need'} a sign-in</b>Until then ${asking.length === 1 ? 'it is' : 'they are'} left out when another service has to stand in. The rest carry on.
+      <div class="callout-acts">${asking.map(id => `<button class="btn" data-variant="text" data-size="sm" type="button" data-signin="${esc(id)}">Sign in to ${esc(nameOf(id))}</button>`).join('')}</div></div></div>`);
+  clearTimeout(holdTimer);
+  if (hold.cool_until) holdTimer = setTimeout(() => load().catch(() => {}), Math.max(1000, hold.cool_until * 1000 - Date.now() + 500));
+}
+const QFILTERS = { all: () => true, active: i => ['queued', 'downloading', 'finalizing'].includes(i.status), failed: i => i.status === 'failed' || i.status === 'skipped', done: i => i.status === 'completed' };
+const groupOf = item => item.group || item.playlist_name || '';
+const inGroup = name => [...S.queue.values()].filter(item => groupOf(item) === name);
+function groupWords(items) {
+  const count = status => items.filter(i => i.status === status).length, active = count('downloading') + count('finalizing');
+  return [`${count('completed')} of ${items.length} done`, active ? `${active} downloading` : '', count('queued') ? `${count('queued')} waiting` : '',
+    count('failed') ? `${count('failed')} failed` : '', count('skipped') ? `${count('skipped')} stopped` : ''].filter(Boolean).join(' · ');
+}
+const doneShare = items => (items.filter(i => i.status === 'completed').length / Math.max(1, items.length)).toFixed(3);
 function renderQueue() {
-  const items = [...S.queue.values()];
-  $('#mo-queue').innerHTML = items.length ? `<ul class="list">${items.map(queueRow).join('')}</ul>`
-    : emptyHtml('queue', 'Nothing in the queue', 'Songs you ask for wait here and download in turn, even with this page closed.', `<a class="btn" data-variant="ink" href="#search">${ms('search')}Find something</a>`);
+  const groups = new Map();
+  for (const item of S.queue.values()) { const key = groupOf(item); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(item); }
+  const show = QFILTERS[S.qfilter] || QFILTERS.all;
+  $('#mo-qfilter').innerHTML = !S.queue.size ? '' : [['all', 'All'], ['active', 'In progress'], ['failed', 'Failed or stopped'], ['done', 'Done']].map(([id, label]) =>
+    `<button class="chip" type="button" role="radio" aria-checked="${id === S.qfilter}" data-qfilter="${id}">${label}<span class="badge">${[...S.queue.values()].filter(QFILTERS[id]).length}</span></button>`).join('');
+  $('#mo-queue').innerHTML = !S.queue.size
+    ? emptyHtml('queue', 'Nothing in the queue', 'Songs you ask for wait here and download in turn, even with this page closed.', `<a class="btn" data-variant="ink" href="#search">${ms('search')}Find something</a>`)
+    : [...groups].map(([name, items]) => {
+      const rows = items.filter(show);
+      return `<details class="mo-group" data-group="${esc(name)}"${S.collapsed.has(name) ? '' : ' open'}>
+        <summary>${ms('expand_more')}<span class="txt"><b>${esc(name || 'Single songs')}</b><span data-group-words>${esc(groupWords(items))}</span></span>
+          <span class="end"><button class="btn" data-size="sm" type="button" data-group-retry data-tip="Try the failed and stopped ones again">${ms('replay')}Retry</button><button class="btn" data-size="sm" type="button" data-group-cancel data-tip="Stop what is waiting or downloading">${ms('close')}Stop</button></span></summary>
+        <div class="progress" style="--v: ${doneShare(items)}" role="progressbar" aria-label="${esc(name || 'Single songs')}" aria-valuenow="${Math.round(doneShare(items) * 100)}" aria-valuemin="0" aria-valuemax="100"></div>
+        ${rows.length ? `<ul class="list" data-size="sm">${rows.map(queueRow).join('')}</ul>` : '<p class="note">None of these here.</p>'}</details>`;
+    }).join('');
   paintQueueCounts();
+  paintHold();
+}
+function paintGroups() {   // a group's words and its bar follow its songs without a redraw
+  $$('#mo-queue details.mo-group').forEach(group => {
+    const items = inGroup(group.dataset.group), words = $('[data-group-words]', group), bar = $(':scope > .progress', group);
+    if (words) words.textContent = groupWords(items);
+    if (bar) { bar.style.setProperty('--v', doneShare(items)); bar.setAttribute('aria-valuenow', Math.round(doneShare(items) * 100)); }
+  });
+  $$('#mo-qfilter [data-qfilter] .badge').forEach(badge => { badge.textContent = [...S.queue.values()].filter(QFILTERS[badge.parentElement.dataset.qfilter]).length; });
+}
+
+/* ── one download in full, and the backend's log ── */
+const logHtml = lines => lines.map(l => {
+  const stamp = String(l.timestamp || ''), level = String(l.level || '').toLowerCase();
+  return `<span class="mo-lv-${esc(level)}">${esc(stamp.includes('T') ? stamp.slice(11, 19) : stamp)} ${esc(level.toUpperCase().padEnd(5))} [${esc(l.tag)}] ${esc(l.message)}</span>`;
+}).join('\n');
+async function showDetail(id) {
+  const data = await post('/api/queue/detail', { id }), item = data.item, t = item.track;
+  const clock = seconds => (seconds ? new Date(seconds * 1000).toLocaleTimeString('en-GB') : '');
+  const took = item.finished_at && item.started_at ? `${Math.max(0, Math.round(item.finished_at - item.started_at))} s` : '';
+  const facts = [['State', statusOf(item)[1]], ['Error', item.error], ['Kind of error', item.error_type], ['Asked of', nameOf(item.service)], ['Quality', item.quality],
+    ['Folder', item.folder || data.request.output_dir], ['File', item.file_path], ['Attempts', item.attempts], ['Started', clock(item.started_at)], ['Took', took],
+    ['Found by', t.provider_id && nameOf(t.provider_id)], ['Track id', t.id], ['ISRC', t.isrc], ['In', groupOf(item)], ['Note', item.warning]].filter(([, value]) => value);
+  S.report = JSON.stringify({ item, request: data.request, log: data.log }, null, 1);
+  $('#mo-item-h').textContent = t.name;
+  $('#mo-item-body').innerHTML = `<dl class="facts sm">${facts.map(([key, value]) => `<div><dt>${key}</dt><dd>${esc(value)}</dd></div>`).join('')}</dl>
+    <h3 class="h4">What was tried</h3>${(item.trail || []).length ? `<ul class="rows">${item.trail.map(line => `<li class="row"><span class="grow">${esc(line)}</span></li>`).join('')}</ul>`
+    : `<p class="note">${item.attempts ? 'The backend named no provider failures for this attempt.' : 'Not started yet.'}</p>`}
+    <h3 class="h4">The backend's log for this attempt</h3>${data.log.length ? `<pre class="mo-log" tabindex="0">${logHtml(data.log)}</pre>`
+    : '<p class="note">No lines are kept for it. They are held in memory from the last attempt since the server started: retry it to record them.</p>'}`;
+  openDialog($('#mo-item-dialog'));
+}
+const LOG = { lines: [], next: 0, timer: 0 };
+async function tailLogs() {
+  clearTimeout(LOG.timer);
+  if (location.hash.slice(1).split('/')[0] !== 'logs') return;
+  try {
+    const got = await call('getLogsSince', { index: LOG.next });
+    if (got?.logs?.length) { LOG.lines = [...LOG.lines, ...got.logs].slice(-4000); paintLogs(); } else if (!$('#mo-log').textContent) paintLogs();
+    if (got) LOG.next = got.next_index;
+  } catch (error) { /* the next pass asks again */ }
+  LOG.timer = setTimeout(tailLogs, 2000);
+}
+function shownLogs() {
+  const words = $('#mo-log-q').value.trim().toLowerCase(), problems = $('#mo-log-problems').checked;
+  return LOG.lines.filter(l => (!problems || /warn|error/i.test(l.level)) && (!words || `${l.tag} ${l.message}`.toLowerCase().includes(words)));
+}
+function paintLogs() {
+  const box = $('#mo-log'), shown = shownLogs(), atFoot = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  box.innerHTML = shown.length ? logHtml(shown.slice(-1500)) : 'Nothing to show yet. Lines arrive here as searches and downloads run.';
+  if (atFoot) box.scrollTop = box.scrollHeight;
+}
+async function runChecks() {
+  const box = $('#mo-checks');
+  box.innerHTML = '<div class="cluster"><span class="spinner"></span><span class="note">Asking each download extension whether its services answer</span></div>';
+  const report = await post('/api/diagnose', {});
+  S.report = JSON.stringify(report, null, 1);
+  const brief = value => (typeof value === 'string' ? value : JSON.stringify(value)).slice(0, 260);
+  box.innerHTML = `<div class="stack fill" style="--gap: 12px"><ul class="list" data-size="sm">${report.checks.map(check => `<li><div class="item"><span class="lead-i">${ms(check.ok ? 'check' : 'error')}</span>
+      <span class="txt"><b>${esc(check.name || check.id)}<span class="tag">${esc(check.version)}</span></b><span${check.ok ? '' : ' class="mo-err"'}>${esc(check.ok ? brief(check.health) : check.error)}</span></span><span class="end">${check.seconds} s</span></div></li>`).join('')}</ul>
+    ${report.errors.length ? `<h3 class="h4">Why downloads failed</h3><ul class="rows">${report.errors.map(e => `<li class="row"><span class="grow">${esc(e.error)}</span><span class="muted num">${e.count} × ${esc(e.type)}</span></li>`).join('')}</ul>` : ''}
+    <div class="cluster"><button class="btn" data-size="sm" type="button" data-act="copy-report">${ms('content_copy')}Copy the full report</button><span class="note">${esc(report.when)}</span></div></div>`;
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast('Copied', { icon: 'content_copy', timeout: 1800 }); }
+  catch (error) { throw new Error('This browser only lets a page copy on localhost or over HTTPS'); }
 }
 let drawing = false;
 function drawQueueSoon() {   // an album arrives as a burst of rows: one redraw for all of them
@@ -475,6 +579,7 @@ const SETTINGS = [
   { head: 'Downloads' },
   { key: 'download_dir', label: 'Folder', icon: 'folder', help: 'A full path on the machine that runs Mornye Web. Empty is Music/Mornye.' },
   { key: 'folder_organization', label: 'Folders', options: [['none', 'All in one folder'], ['artist', 'A folder for each artist'], ['album', 'A folder for each album'], ['artist_album', 'Artist, then album'], ['playlist', 'A folder for each playlist']] },
+  { key: 'playlist_folder', label: 'A folder for each playlist', small: 'Named after the playlist, with the folders above inside it', toggle: true },
   { key: 'filename_format', label: 'File names', icon: 'label', help: '{title} {artist} {album} {track} {disc} {year} {date} {isrc} {quality} {playlist_position}' },
   { key: 'concurrent_downloads', label: 'At once', number: true, options: [[1, 'One at a time'], [2, 'Two'], [3, 'Three']] },
   { key: 'auto_fallback', label: 'Try other services', small: 'When the chosen one does not have the song', toggle: true },
@@ -528,13 +633,22 @@ function confirm(title, words, yes) {
 /* ════════ what a press does ════════ */
 const PRESS = {
   '[data-get]': el => enqueue([S.rows[+el.dataset.get]]),
-  '[data-get-all]': () => { const v = S.search.view; enqueue(v.tracks, v.type === 'playlist' ? v.name : ''); },
+  '[data-get-all]': () => { const v = S.search.view; enqueue(v.tracks, v.type === 'playlist' ? v.name : '', v.name); },
   '[data-get-albums]': () => enqueueAlbums(S.search.view),
   '[data-back]': () => { if (location.hash.split('/').length > 1) location.hash = '#search'; else { S.search.view = S.search.view?.back || null; renderResults(); } },
   '[data-filter]': el => { S.search.filter = el.dataset.filter; renderSearchOptions(); search($('#mo-q').value); },
   '[data-cancel]': el => post('/api/queue/cancel', { ids: [el.dataset.cancel] }),
   '[data-retry]': el => post('/api/queue/retry', { ids: [el.dataset.retry] }),
   '[data-signin]': el => openAuth(el.dataset.signin),
+  '[data-act="queue-pause"]': async () => { S.hold = await post('/api/queue/pause', { paused: !(S.hold?.paused || S.hold?.cool_until > 0) }); paintHold(); },
+  '[data-detail]': el => showDetail(el.dataset.detail),
+  '[data-qfilter]': el => { S.qfilter = el.dataset.qfilter; renderQueue(); },
+  '[data-group-retry]': el => post('/api/queue/retry', { ids: inGroup(el.closest('details').dataset.group).map(i => i.id) }),
+  '[data-group-cancel]': el => post('/api/queue/cancel', { ids: inGroup(el.closest('details').dataset.group).map(i => i.id) }),
+  '[data-act="checks"]': () => runChecks(),
+  '[data-act="copy-report"]': () => copyText(S.report),
+  '[data-act="copy-log"]': () => copyText(shownLogs().map(l => `${l.timestamp} ${l.level} [${l.tag}] ${l.message}`).join('\n')),
+  '[data-act="clear-log"]': async () => { await call('clearLogs'); LOG.lines = []; LOG.next = 0; paintLogs(); },
   '[data-act="queue-retry"]': () => post('/api/queue/retry', {}),
   '[data-act="queue-clear"]': () => post('/api/queue/clear', {}),
   '[data-act="queue-cancel"]': async () => { if (await confirm('Cancel every download?', 'Songs still waiting or on their way stop. What has finished stays.', 'Cancel them')) await post('/api/queue/cancel', {}); },
@@ -569,7 +683,8 @@ const PRESS = {
 document.addEventListener('click', event => {
   for (const [sel, run] of Object.entries(PRESS)) {
     const el = event.target.closest(sel);
-    if (el) { Promise.resolve().then(() => run(el)).catch(fail); return; }
+    if (el) { if (el.closest('summary')) event.preventDefault();   // a button in a group's head does its job, it does not fold the group
+      Promise.resolve().then(() => run(el)).catch(fail); return; }
   }
 });
 
@@ -597,6 +712,12 @@ document.addEventListener('change', event => {
 $('#mo-search').addEventListener('submit', event => { event.preventDefault(); search($('#mo-q').value); });
 $('#mo-q').addEventListener('search', event => { if (!event.target.value) search(''); });
 $('#mo-library-q').addEventListener('input', renderLibrary);
+$('#mo-log-q').addEventListener('input', paintLogs);
+$('#mo-log-problems').addEventListener('change', paintLogs);
+document.addEventListener('toggle', event => {   // which groups are folded survives a redraw
+  const group = event.target;
+  if (group.matches?.('details.mo-group')) group.open ? S.collapsed.delete(group.dataset.group) : S.collapsed.add(group.dataset.group);
+}, true);
 $('#mo-repo-form').addEventListener('submit', event => {
   event.preventDefault();
   const url = $('#mo-repo-url').value.trim();

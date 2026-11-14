@@ -26,6 +26,7 @@
     <a href="#library">Library</a>
     <a href="#extensions">Extensions</a>
     <a href="#settings">Settings</a>
+    <a href="#logs">Logs</a>
   </nav>
   <div class="hdr-end">
     <span class="status hide-phone" id="mo-backend" role="status"><i class="dot breathe"></i>Starting</span>
@@ -40,6 +41,7 @@
     <a href="#library" data-close>Library</a>
     <a href="#extensions" data-close>Extensions</a>
     <a href="#settings" data-close>Settings</a>
+    <a href="#logs" data-close>Logs</a>
   </nav></div>
 </dialog>
 
@@ -71,17 +73,20 @@
       <div class="cluster between">
         <h1 class="h3" id="mo-queue-h">Queue</h1>
         <div class="cluster">
+          <button class="btn" data-size="sm" type="button" data-act="queue-pause" id="mo-pause"><span class="ms">pause</span>Pause</button>
           <button class="btn" data-size="sm" type="button" data-act="queue-retry"><span class="ms">replay</span>Retry failed</button>
           <button class="btn" data-size="sm" type="button" data-act="queue-clear"><span class="ms">done_all</span>Clear finished</button>
           <button class="btn" data-size="sm" data-variant="danger" type="button" data-act="queue-cancel"><span class="ms">cancel</span>Cancel all</button>
         </div>
       </div>
+      <div id="mo-hold"></div>
       <div class="stats mo-stats" id="mo-queue-stats" style="--n: 4">
         <div class="stat"><b data-stat="downloading">0</b><span>downloading</span></div>
         <div class="stat"><b data-stat="queued">0</b><span>waiting</span></div>
         <div class="stat"><b data-stat="completed">0</b><span>done</span></div>
         <div class="stat"><b data-stat="failed">0</b><span>failed</span></div>
       </div>
+      <div class="chips" role="radiogroup" aria-label="Show" id="mo-qfilter"></div>
       <div id="mo-queue"></div>
     </div>
   </section>
@@ -139,6 +144,25 @@
       <form class="form mo-settings" id="mo-settings" onsubmit="return false"></form>
     </div>
   </section>
+  <!-- Logs: what the backend and its extensions said, and whether their services answer -->
+  <section class="panel tight" data-view="logs" aria-labelledby="mo-logs-h" hidden>
+    <div class="in stack fill mo-view">
+      <div class="cluster between">
+        <h1 class="h3" id="mo-logs-h">Logs</h1>
+        <div class="cluster">
+          <form class="search-form mo-filter" role="search" aria-label="The log" onsubmit="return false">
+            <div class="field search" data-size="sm"><span class="ms">search</span><input type="search" id="mo-log-q" aria-label="Filter the log" placeholder="Filter" autocomplete="off"><button class="ib" type="button" data-clear aria-label="Clear the filter"><span class="ms">close</span></button></div>
+          </form>
+          <label class="chip"><input type="checkbox" id="mo-log-problems">Problems only</label>
+          <button class="btn" data-size="sm" data-variant="ink" type="button" data-act="checks"><span class="ms">fact_check</span>Run checks</button>
+          <button class="btn" data-size="sm" type="button" data-act="copy-log"><span class="ms">content_copy</span>Copy</button>
+          <button class="btn" data-size="sm" type="button" data-act="clear-log"><span class="ms">delete</span>Clear</button>
+        </div>
+      </div>
+      <div id="mo-checks"></div>
+      <pre class="mo-log" id="mo-log" tabindex="0" aria-label="The backend's log"></pre>
+    </div>
+  </section>
 </main>
 
 <!-- One extension's settings -->
@@ -164,6 +188,13 @@
     </div>
     <div class="dialog-foot"><button class="btn" data-variant="text" type="button" data-close>Not now</button><button class="btn" data-variant="ink" type="submit">Finish signing in</button></div>
   </form>
+</dialog>
+
+<!-- One download, in full: what was asked, what was tried, what the backend said -->
+<dialog class="dialog wide" id="mo-item-dialog" aria-labelledby="mo-item-h">
+  <div class="dialog-head"><h2 id="mo-item-h">Download</h2><button class="ib" type="button" data-close aria-label="Close"><span class="ms">close</span></button></div>
+  <div class="dialog-body stack fill" id="mo-item-body"></div>
+  <div class="dialog-foot"><button class="btn" data-variant="text" type="button" data-act="copy-report"><span class="ms">content_copy</span>Copy the report</button><button class="btn" data-variant="ink" type="button" data-close>Close</button></div>
 </dialog>
 
 <!-- Asked before anything is thrown away -->

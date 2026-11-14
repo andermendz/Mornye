@@ -53,17 +53,21 @@ The server calls the backend's own method table (`rust_backend/crates/desktop/sr
 names and arguments of `lib/services/platform_bridge.dart`, and does in Python what the app does in Dart around a
 download (`lib/providers/download_queue_provider*.dart`):
 
-- the queue: up to three at once, cancel, retry, one automatic retry after a rate limit, sign-in when an extension
-  asks for it, skipping what a batch already has;
-- the request: folders, file name template, quality, service, fallback to other services, region;
+- the queue: one to three at once, pause, cancel, retry, one automatic retry after a rate limit, sign-in when an
+  extension asks for it, skipping what a batch already has. It is grouped by playlist, album or discography, is saved
+  to disk, and holds itself for ten minutes after five failures in a row;
+- fallback: every enabled download extension is kept on the backend's priority list (lossless ones first), and a
+  stand-in that wants a sign-in is left out until you sign in, instead of failing the song;
+- the request: folders (a folder for each playlist by default), file name template, quality, service, region;
 - after the download: decrypting with the provider's key, MP4 to FLAC when FLAC was asked for, tags and cover for
   what the backend does not tag itself, lyrics into the file or beside it as `.lrc`;
-- the history, extension install, update, settings, sign-in, and provider order.
+- the history, extension install, update, settings, sign-in, and provider order;
+- debugging: every download keeps which services were tried and why each said no, with the backend's log for that
+  attempt; the Logs page tails the backend log and runs a health check of each download extension.
 
 Not ported: the player and everything around it (equaliser, lyrics view, widgets, Cast, Link), the local library
 scanner and network storage, ReplayGain, automatic conversion to MP3/AAC/Opus, the fake Hi-Res check, extension
-post-processing hooks, the home feed, CSV/M3U import, custom folder templates, backup and restore. A queue that was
-still waiting is lost when the server stops; finished downloads are not.
+post-processing hooks, the home feed, CSV/M3U import, custom folder templates, backup and restore.
 
 Signing in to a service finishes on a `mornye://` link, which only the installed app can open. Here the sign-in
 dialog asks you to paste that link back.

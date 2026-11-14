@@ -37,3 +37,24 @@
 .mo-settings { max-width: 760px; }
 .mo-settings h2 { margin-top: 18px; }
 .mo-settings .switch-row { width: 100%; }
+
+/* the queue's groups: a playlist, an album or a discography, folded or open, with what is left of it */
+.mo-group { display: grid; gap: 8px; margin-bottom: 16px; }
+.mo-group > summary { display: flex; align-items: center; gap: 12px; min-height: 60px; padding: 8px 14px; border-radius: 22px; background: var(--tile); cursor: pointer; list-style: none; --here: var(--tile); --tone: var(--g); }
+.mo-group > summary::-webkit-details-marker { display: none; }
+.mo-group > summary > .ms { flex: none; transition: rotate .2s var(--ease); }
+.mo-group:not([open]) > summary > .ms { rotate: -90deg; }
+.mo-group > summary .txt { display: grid; gap: 2px; flex: 1 1 auto; min-width: 0; }
+.mo-group > summary .txt b { font: 500 var(--ctl-fs)/1.3 var(--ff); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mo-group > summary .txt span { font: 400 var(--t-note)/1.35 var(--ff); color: var(--ink2); }
+.mo-group > summary .end { display: flex; gap: 8px; flex: none; }
+@media (max-width: 640px) { .mo-group > summary { flex-wrap: wrap; } }
+@media (prefers-reduced-motion: reduce) { .mo-group > summary > .ms { transition: none; } }
+
+/* the log: code, so monospaced; a hue only where a line is a warning or an error */
+.mo-log { max-height: 62vh; min-height: 120px; overflow: auto; margin: 0; padding: 14px 16px; border-radius: 18px; background: var(--tile); color: var(--ink); font: 12.5px/1.55 var(--ff-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.dialog .mo-log { max-height: 38vh; background: var(--g); }
+.mo-lv-warn, .mo-lv-warning { color: var(--warn); }
+.mo-lv-error { color: var(--danger); }
+.mo-lv-debug { color: var(--ink2); }
+#mo-item-body .facts dd { overflow-wrap: anywhere; }
