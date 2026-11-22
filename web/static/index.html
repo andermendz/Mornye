@@ -197,6 +197,18 @@
   <div class="dialog-foot"><button class="btn" data-variant="text" type="button" data-act="copy-report"><span class="ms">content_copy</span>Copy the report</button><button class="btn" data-variant="ink" type="button" data-close>Close</button></div>
 </dialog>
 
+<!-- A playlist's link, asked for once so it can be read again -->
+<dialog class="dialog" id="mo-link-dialog" aria-labelledby="mo-link-h">
+  <div class="dialog-head"><h2 id="mo-link-h">Check for new songs</h2><button class="ib" type="button" data-close aria-label="Close"><span class="ms">close</span></button></div>
+  <form class="form" id="mo-link-form" onsubmit="return false">
+    <div class="dialog-body stack fill">
+      <p class="muted">Its link was not kept when it was added. Paste it once; after that the check needs nothing.</p>
+      <div class="formrow"><label class="label" for="mo-link-url">The playlist's link</label><div class="field"><span class="ms">link</span><input id="mo-link-url" name="url" type="url" placeholder="https://…" autocomplete="off" spellcheck="false" required></div></div>
+    </div>
+    <div class="dialog-foot"><button class="btn" data-variant="text" type="button" data-close>Not now</button><button class="btn" data-variant="ink" type="submit">Check it</button></div>
+  </form>
+</dialog>
+
 <!-- Asked before anything is thrown away -->
 <dialog class="dialog" data-variant="confirm" id="mo-confirm" aria-labelledby="mo-confirm-h" aria-describedby="mo-confirm-d">
   <div class="dialog-head"><span class="dialog-icon" data-tone="danger"><span class="ms">delete</span></span><h2 id="mo-confirm-h">Remove?</h2></div>

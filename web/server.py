@@ -13,6 +13,9 @@ and the history. Standard library only.
 import argparse
 import base64
 import ctypes
+import hashlib
+import hmac
+import http.client
 import itertools
 import json
 import mimetypes
@@ -25,6 +28,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
+import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -376,6 +382,60 @@ def number(source, key):
         return 0
 
 
+def seconds_left(expires_at):
+    """How long a session still has, from its RFC 3339 expiry; None when it does not say."""
+    try:
+        when = datetime.fromisoformat(expires_at.strip().replace('Z', '+00:00'))
+        return when.timestamp() - time.time() if when.tzinfo else None
+    except (ValueError, TypeError):
+        return None
+
+
+def session_headers(config, record, method, url, body, now_ms, nonce):
+    """signed_session/protocol.rs `signed_headers`: what a service's gateway wants on a request made in a session's name."""
+    def mac(key, message):
+        return base64.urlsafe_b64encode(hmac.new(key.encode(), message.encode(), 'sha256').digest()).rstrip(b'=').decode()
+    app, platform, window = text(config, 'appVersion') or 'ext-1.0', text(config, 'platform') or 'extension', number(config, 'timeWindowSeconds')
+    stamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now_ms // 1000)) + f'.{now_ms % 1000:03d}Z'
+    digest = hashlib.sha256(body).hexdigest()
+    rolling = mac(record['session_secret'], f"{now_ms // 1000 // (window if window > 0 else 300)}:{record['session_id']}")
+    signature = mac(rolling, '\n'.join([text(config, 'schemeLabel') or 'SPOTIFLAC-HMAC-V1', method, urlparse(url).path, '', digest, stamp,
+                                        nonce, record['session_id'], app, platform]))
+    fields = {'Session': record['session_id'], 'Timestamp': stamp, 'Nonce': nonce, 'Body-SHA256': digest, 'Signature': signature,
+              'App-Version': app, 'Platform': platform}
+    return {(text(config, 'headerPrefix') or 'X-Sig-') + name: value for name, value in fields.items()}
+
+
+PAGE_TITLE = 'Verification - Mornye'   # ponytail: the sign-in page is found again by its title; one that is named otherwise just stays open
+
+
+def open_page(url):
+    """A sign-in page, in a window of its own where the default browser has such a thing (Chromium's --app, in the
+    user's own profile), so that close_pages can take it away again; anywhere else as a tab, which stays."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice') as key:
+            browser = winreg.QueryValueEx(key, 'ProgId')[0]
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, browser + r'\shell\open\command') as key:
+            program = re.match(r'"([^"]+)"|(\S+)', winreg.QueryValueEx(key, '')[0])
+        program = program.group(1) or program.group(2)
+        if Path(program).name.lower() in ('chrome.exe', 'msedge.exe', 'brave.exe', 'vivaldi.exe'):
+            return subprocess.Popen([program, f'--app={url}'])
+    except (ImportError, OSError, AttributeError):
+        pass
+    webbrowser.open(url)
+
+
+def close_pages():
+    """Windows: the sign-in windows open_page opened are closed, as their own close button would."""
+    if os.name != 'nt':
+        return
+    find, window = ctypes.windll.user32.FindWindowExW, None
+    find.restype, find.argtypes = ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p]
+    while window := find(None, window, None, PAGE_TITLE):
+        ctypes.windll.user32.PostMessageW(ctypes.c_void_p(window), 0x0010, 0, 0)   # WM_CLOSE
+
+
 def safe_name(value, empty='Unknown'):
     """A folder name any filesystem takes (the app's sanitizer: forbidden characters become spaces, empty is Unknown)."""
     return re.sub(r'\s+', ' ', re.sub(r'[<>:"/\\|?*\x00-\x1f]', ' ', value)).strip(' .') or empty
@@ -425,7 +485,7 @@ def clean_setting(key, value):
 
 
 class App:
-    def __init__(self, data_dir, library, token=''):
+    def __init__(self, data_dir, library, token='', auto_signin=True):
         self.dir, self.library, self.token = Path(data_dir).resolve(), Path(library), token
         for name in ('extensions', 'data', 'repo', 'tmp'):
             (self.dir / name).mkdir(parents=True, exist_ok=True)
@@ -438,9 +498,14 @@ class App:
             if item.get('status') in ('downloading', 'finalizing'):
                 item['status'] = 'queued'
             self.items[item['id']] = item
-        self.dirty, self.paused, self.cool_until, self.hold_reason, self.streak = False, False, 0, '', 0
-        self.needs_signin = set()   # stand-in services that asked for a sign-in: left out of fallback until signed in to
+        self.kept = Store(self.dir / 'hold.json', {})
+        self.playlists = Store(self.dir / 'playlists.json', {})   # group -> its link, whether it syncs, when it was last read
+        self.dirty, self.streak = False, 0
+        self.paused, self.cool_until, self.hold_reason = self.kept.data.get('paused') is True, self.kept.data.get('cool_until') or 0, self.kept.data.get('reason') or ''
+        self.needs_signin = set(self.kept.data.get('signin') or [])   # services that asked for a sign-in: left out of fallback until signed in to
         self.item_logs = {}   # id -> the backend's log lines from that download's last attempt (memory only: they are large)
+        self.auto, self.nudge = auto_signin, threading.Event()   # signing in without being asked: see keeper
+        self.asked, self.unanswered, self.pages = 0, 0, {}       # when a sign-in page was last opened here, how many in a row nobody answered, when for each service
         self.lock = threading.RLock()
         self.wake = threading.Condition(self.lock)
         self.seq = itertools.count(1)
@@ -453,9 +518,12 @@ class App:
             '/api/settings': self.update_settings, '/api/queue/add': self.add, '/api/queue/cancel': self.cancel,
             '/api/queue/retry': self.retry, '/api/queue/clear': self.clear, '/api/history/remove': self.forget,
             '/api/extensions/install': self.install, '/api/priority': self.set_priority, '/api/queue/pause': self.pause,
-            '/api/queue/detail': self.detail, '/api/diagnose': self.diagnose,
+            '/api/queue/detail': self.detail, '/api/diagnose': self.diagnose, '/api/queue/refresh': self.refresh,
+            '/api/queue/sync': self.set_sync, '/api/signin/check': self.recheck_signin,
         }
         threading.Thread(target=self.dispatch, daemon=True).start()
+        threading.Thread(target=self.sync_loop, daemon=True).start()
+        threading.Thread(target=self.keeper, daemon=True).start()
 
     # ── settings and the backend's start ──
 
@@ -487,7 +555,7 @@ class App:
             if self.setting(name):
                 call(method, {'priority': json.dumps(self.setting(name))}, 30)
         self.installed()
-        self.apply_fallback()
+        self.recheck_signin()
         self.sync_priority()
 
     def installed(self):
@@ -542,6 +610,7 @@ class App:
             'settings': {**DEFAULTS, **self.settings.data}, 'download_dir': self.download_dir(),
             'queue': list(self.items.values()), 'progress': self.progress, 'history': self.history.data,
             'service': self.default_service(), 'extensions': self.extensions, 'hold': self.hold(), 'signin': sorted(self.needs_signin),
+            'playlists': self.playlists.data,
             'priority': self.sync_priority(),
             'about': {'version': APP_VERSION, 'library': str(self.library), 'data': str(self.dir), 'ffmpeg': bool(self.ffmpeg and self.ffprobe)},
         }
@@ -612,9 +681,8 @@ class App:
                 threading.Thread(target=lambda: self.backend.call('processPendingExtensionCallbacks', None, 300), daemon=True).start()
             elif data.get('method') == 'extensionSessionGrantCompleted':
                 grant = data.get('arguments') or {}
-                if grant.get('success'):   # signed in: it may stand in again
-                    self.needs_signin = {i for i in self.needs_signin if i.lower() != str(grant.get('extension_id')).lower()}
-                    threading.Thread(target=self.signin_changed, daemon=True).start()
+                if grant.get('success'):
+                    threading.Thread(target=self.signed_in, args=(str(grant.get('extension_id')),), daemon=True).start()
                 self.hub.publish('auth', grant)
 
     # ── the queue ──
@@ -626,14 +694,21 @@ class App:
 
     # ── holding the queue: by hand, or by itself when a run of failures says the services have stopped answering ──
 
+    def keep_hold(self):
+        self.kept.data = {'paused': self.paused, 'cool_until': self.cool_until, 'reason': self.hold_reason, 'signin': sorted(self.needs_signin)}
+        self.kept.save()
+
     def hold(self):
         cooling = self.cool_until > time.time()
-        return {'paused': self.paused, 'cool_until': self.cool_until if cooling else 0, 'reason': self.hold_reason if cooling else ''}
+        return {'paused': self.paused, 'cool_until': self.cool_until if cooling else 0, 'reason': self.hold_reason if cooling or self.paused else ''}
 
     def pause(self, body):
+        if body.get('paused') is not True:
+            self.recheck_signin()   # resuming: whoever stopped asking in the meantime is back in
         with self.wake:
-            self.paused, self.cool_until, self.streak = body.get('paused') is True, 0, 0
+            self.paused, self.cool_until, self.streak, self.hold_reason = body.get('paused') is True, 0, 0, ''
             self.wake.notify_all()
+        self.keep_hold()
         self.hub.publish('hold', self.hold())
         return self.hold()
 
@@ -662,8 +737,8 @@ class App:
             for entry in self.history.data:
                 have |= self.identities({'id': entry.get('track_id'), 'isrc': entry.get('isrc'), 'name': entry.get('title'), 'artists': entry.get('artist')})
         with self.wake:
-            for item in self.items.values():
-                if item['status'] in ('queued', 'downloading', 'finalizing'):
+            for item in self.items.values():   # a batch also leaves alone what failed or was stopped: those are retried, not added twice
+                if item['status'] in ('queued', 'downloading', 'finalizing') or batch:
                     have |= self.identities(item['track'])
             for index, track in enumerate(tracks):
                 if have & self.identities(track):
@@ -673,7 +748,7 @@ class App:
                 self.items[item_id] = item = {
                     'id': item_id, 'track': track, 'service': service, 'quality': quality, 'playlist_name': playlist,
                     'playlist_position': number(track, 'playlist_position') or (index + 1 if playlist else 0),
-                    'group': text(body, 'group') or playlist,
+                    'group': text(body, 'group') or playlist, 'source_url': text(body, 'source_url'),
                     'from_batch': batch, 'status': 'queued', 'error': '', 'error_type': '', 'added_at': time.time(),
                     'retried': False, 'not_before': 0}
                 added.append(item)
@@ -682,6 +757,65 @@ class App:
         for item in added:
             self.hub.publish('queue', item)
         return {'added': len(added), 'skipped': len(tracks) - len(added)}
+
+    def refresh(self, body):
+        """Read a playlist or an album again from its link and queue only what its group does not hold yet."""
+        group = text(body, 'group')
+        with self.lock:
+            members = [i for i in self.items.values() if (i.get('group') or i.get('playlist_name') or '') == group]
+        known = self.playlists.data.get(group) or {}
+        url = text(body, 'url') or text(known, 'url') or next((i['source_url'] for i in members if i.get('source_url')), '')
+        url = url.split('?si=')[0]   # a share link's tracking tail is not part of the playlist
+        if not re.match(r'https?://', url):
+            raise ValueError('Paste the link of this playlist once, so it can be read again')
+        found = self.backend.call('handleURLWithExtension', {'url': url}, 300)
+        if not isinstance(found, dict) or found.get('type') not in ('playlist', 'album'):
+            raise ValueError('That link is not a playlist or an album')
+        have, provider = set(), text(found, 'extension_id')
+        for item in members:
+            item['source_url'] = url   # remembered: the next check needs no link
+            have |= self.identities(item['track'])
+        self.dirty = True
+        fresh = []
+        for index, track in enumerate(found.get('tracks') or []):
+            if not isinstance(track, dict):
+                continue
+            images = track.get('images')
+            track = {**track, 'id': text(track, 'id') or text(track, 'spotify_id'), 'provider_id': text(track, 'provider_id') or provider,
+                     'cover_url': text(track, 'cover_url') or (images if isinstance(images, str) else ''), 'playlist_position': index + 1}
+            if not have & self.identities(track):
+                have |= self.identities(track)
+                fresh.append(track)
+        total = len(found.get('tracks') or [])
+        added = 0
+        if fresh:
+            playlist = (members[0]['playlist_name'] if members else '') or (text(found, 'name') if found['type'] == 'playlist' else '')
+            added = self.add({'tracks': fresh, 'playlist_name': playlist, 'group': group or text(found, 'name'), 'source_url': url})['added']
+        self.note_playlist(group, url=url, checked_at=time.time(), total=total, added=added, error='')
+        return {'added': added, 'total': total}
+
+    def note_playlist(self, group, **fields):
+        self.playlists.data.setdefault(group, {'auto': False}).update(fields)
+        self.playlists.save()
+        self.hub.publish('playlists', self.playlists.data)
+
+    def set_sync(self, body):
+        group = text(body, 'group')
+        if not text(self.playlists.data.get(group) or {}, 'url'):
+            raise ValueError('Check it for new songs once first, so its link is known')
+        self.note_playlist(group, auto=body.get('auto') is True)
+        return self.playlists.data[group]
+
+    def sync_loop(self):
+        """A playlist that syncs is read again every half hour; what is new goes into the queue, and so into its folder."""
+        while True:
+            time.sleep(60)
+            for group, entry in list(self.playlists.data.items()):
+                if entry.get('auto') and time.time() - (entry.get('checked_at') or 0) >= 1800:
+                    try:
+                        self.refresh({'group': group})
+                    except Exception as error:   # the link or the service said no this time: say so, try again next round
+                        self.note_playlist(group, checked_at=time.time(), error=getattr(error, 'message', None) or str(error))
 
     def chosen(self, body, states):
         ids = body.get('ids')
@@ -873,9 +1007,132 @@ class App:
         entry = self.remember(item, result, path)
         self.change(item, status='completed', error='', error_type='', file_path=path, history_id=entry['id'])
 
+    def stand_in(self, service):
+        """The next download service in priority order that is not waiting for a sign-in, with its best quality."""
+        order = [i.lower() for i in self.sync_priority()['download']]
+        skip = {i.lower() for i in self.needs_signin} | {service.lower()}
+        allowed = self.setting('fallback_ids')
+        able = [e for e in self.extensions if e.get('enabled') and e.get('has_download_provider') and text(e, 'id').lower() not in skip
+                and lossless(e) and (allowed is None or text(e, 'id') in allowed)]
+        able.sort(key=lambda e: order.index(e['id'].lower()) if e['id'].lower() in order else len(order))
+        if not able:
+            return None, None
+        options = able[0].get('quality_options') or []
+        best = next((q for q in options if lossless({'quality_options': [q]})), options[0] if options else None)
+        return text(able[0], 'id'), text(best, 'id') if best else None
+
+    def recheck_signin(self, body=None):
+        """Ask each service on the list whether it still wants a sign-in. One that has no sign-in page to offer is not
+        waiting for anything: it comes off the list and is tried again."""
+        for waiting in list(self.needs_signin):
+            try:
+                pending = self.backend.call('getExtensionPendingAuth', {'extension_id': waiting}, 60)
+            except BackendError:
+                continue
+            if not (isinstance(pending, dict) and pending.get('auth_url')):
+                self.needs_signin.discard(waiting)
+        self.signin_changed()
+        return sorted(self.needs_signin)
+
     def signin_changed(self):
+        self.keep_hold()
         self.apply_fallback()
         self.hub.publish('signin', sorted(self.needs_signin))
+        self.nudge.set()
+
+    # ── signing in without being asked ──
+
+    def signed_in(self, who):
+        """A service is signed in again: it may stand in again, a queue that stopped itself to wait for this goes on by
+        itself, and the next service still waiting is asked."""
+        self.needs_signin = {i for i in self.needs_signin if i.lower() != who.lower()}
+        self.asked, self.unanswered = 0, 0
+        print(f"{time.strftime('%H:%M:%S')} {who}: signed in", file=sys.stderr, flush=True)
+        close_pages()
+        if self.paused and self.hold_reason:
+            self.pause({'paused': False})
+        else:
+            self.signin_changed()
+
+    def keeper(self):
+        """Sessions are renewed before they run out; a service that wants a sign-in all the same has its page opened."""
+        renewed = 0
+        while True:
+            self.nudge.wait(60)
+            self.nudge.clear()
+            try:
+                if time.time() - renewed >= 300:
+                    renewed = time.time()
+                    self.keep_sessions()
+                self.auto_signin()
+            except Exception as error:   # the next round tries again
+                print('sign-in keeper:', error, file=sys.stderr, flush=True)
+
+    def keep_sessions(self):
+        """The backend renews a session only when a request happens to go out in its last hour (signed_session/fetch.rs),
+        so a queue that sits still for longer loses every sign-in at once. Each session is renewed here instead, as
+        signed_session/exchange.rs `refresh` does it, once it has under three hours left of its six: the gateway takes
+        an early renewal, and that leaves room for a machine that sleeps a while. The backend reads the record again
+        at its next request."""
+        configs = None
+        for path in (self.dir / 'data' / 'signed_sessions').glob('*.json'):
+            record = Store(path, {})
+            left = seconds_left(text(record.data, 'expires_at'))
+            if not (left and 0 < left <= 3 * 3600 and text(record.data, 'session_id') and text(record.data, 'session_secret')):
+                continue
+            if configs is None:   # the installed extensions' gateways, by what a record says of its own
+                configs = {}
+                for manifest in (self.dir / 'extensions').glob('*/manifest.json'):
+                    config = Store(manifest, {}).data.get('signedSession')
+                    if isinstance(config, dict) and text(config.get('endpoints'), 'refresh'):
+                        configs[text(config, 'baseUrl'), text(config, 'appVersion') or 'ext-1.0', text(config, 'platform') or 'extension'] = config
+            config = configs.get((text(record.data, 'base_url'), text(record.data, 'app_version'), text(record.data, 'platform')))
+            try:
+                if config:
+                    print(f"{time.strftime('%H:%M:%S')} {text(record.data, 'app_version')}: session renewed until {self.renew(record, config)}", file=sys.stderr, flush=True)
+            except (OSError, ValueError) as error:   # the gateway or the network said no: asked again in five minutes; one that does run out is signed in to again
+                print(f"{time.strftime('%H:%M:%S')} {text(record.data, 'app_version')}: session not renewed: {error}", file=sys.stderr, flush=True)
+
+    def renew(self, record, config):
+        old, endpoint = dict(record.data), text(config['endpoints'], 'refresh')
+        url = endpoint if endpoint.startswith('https://') else f"{text(config, 'baseUrl').rstrip('/')}/{endpoint.lstrip('/')}"
+        if not url.startswith('https://'):
+            raise ValueError('its gateway is not https')
+        body = json.dumps({'install_id': text(old, 'install_id')}).encode()
+        headers = {**session_headers(config, old, 'POST', url, body, time.time_ns() // 1_000_000, secrets.token_hex(12)),
+                   'Content-Type': 'application/json', 'Accept': 'application/json', 'User-Agent': f"Mornye/{text(old, 'app_version')}"}
+        with urllib.request.urlopen(urllib.request.Request(url, body, headers), timeout=30) as response:
+            answer = json.loads(response.read(1 << 20))
+        fresh = {key.lower(): value for key, value in answer.items() if isinstance(value, str) and value} if isinstance(answer, dict) else {}
+        latest = Store(record.path, {})
+        if any(latest.data.get(key) != old.get(key) for key in ('session_id', 'session_secret')):
+            return text(latest.data, 'expires_at')   # the backend got a session of its own meanwhile: that one stands
+        latest.data.update({key: fresh[key] for key in ('session_id', 'session_secret', 'expires_at') if key in fresh})
+        latest.save()
+        return text(latest.data, 'expires_at')
+
+    def auto_signin(self):
+        """A service that wants a sign-in while songs wait has its page opened on this machine, one page at a time. The
+        page ends on a mornye:// link, which --register-link sends back here: then the queue goes on (signed_in) and
+        the next one is asked. The page's own check of who is asking is the browser's to pass, not ours."""
+        now = time.time()
+        waiting = [i for i in self.needs_signin if now - self.pages.get(i, 0) >= 600]   # one that was just seen to is left alone: no loop of asking
+        if not (self.auto and waiting) or (self.paused and not self.hold_reason) or self.unanswered >= 3 or (self.asked and now - self.asked < 3600):
+            return   # ponytail: a page nobody answers is tried again an hour on, three times; then it waits for a sign-in by hand or a restart
+        with self.lock:
+            if not any(item['status'] == 'queued' for item in self.items.values()):
+                return
+        order = [i.lower() for i in self.sync_priority()['download']]
+        who = min(waiting, key=lambda i: (self.pages.get(i, 0), order.index(i.lower()) if i.lower() in order else len(order)))
+        self.pages[who] = now
+        url = text(self.backend.call('getExtensionPendingAuth', {'extension_id': who}, 60), 'auth_url')
+        if not url.startswith('https://'):   # it is not asking any more
+            return self.signed_in(who)
+        self.unanswered += bool(self.asked)   # the page before this one went unanswered
+        self.asked = now
+        print(f"{time.strftime('%H:%M:%S')} {who}: sign-in page opened", file=sys.stderr, flush=True)
+        close_pages()   # one that went unanswered is dead by now
+        open_page(url)
 
     def failed(self, item, result):
         kind = text(result, 'error_type') or 'unknown'
@@ -892,6 +1149,26 @@ class App:
             with self.wake:
                 self.change(item, status='queued', error=f'{asking.group(1)} needs a sign-in: trying the other services', error_type='')
             return
+        if kind == 'verification_required' and self.setting('auto_fallback') and (not asking or asking.group(1).lower() == item['service'].lower()):
+            # the chosen service itself wants a sign-in, and the backend stops there before any fallback. With fallback
+            # on, the song moves to the next service that is signed in; the one that asked waits for its sign-in.
+            who = item['service']
+            self.needs_signin.add(who)
+            other, quality = self.stand_in(who)
+            self.signin_changed()
+            if other:
+                item.setdefault('first_choice', [item['service'], item['quality']])
+                with self.wake:
+                    self.change(item, status='queued', service=other, quality=quality or item['quality'], error=f'{who} needs a sign-in: asking {other} instead', error_type='')
+                return
+            # nobody left to ask: this is not the song failing. The queue waits, with every song still in it.
+            with self.wake:
+                self.paused, self.streak = True, 0
+                self.hold_reason = 'Every service that has these songs in full quality is waiting for a sign-in. Sign in to one of them, then resume.'
+                self.change(item, status='queued', error=f'{who} needs a sign-in', error_type='')
+            self.keep_hold()
+            self.hub.publish('hold', self.hold())
+            return
         if kind == 'rate_limit' and not item['retried']:   # the app's one automatic retry
             wait = max(5, min(300, number(result, 'retry_after_seconds') or 30))
             with self.wake:
@@ -901,6 +1178,7 @@ class App:
         if self.streak >= 5:   # one song missing is the song; five in a row is the lookups being refused: stop spending the queue on it
             self.streak, self.cool_until = 0, time.time() + 600
             self.hold_reason = 'Five downloads in a row failed, which usually means a lookup service is refusing requests for now. Retry the failed ones once it lifts.'
+            self.keep_hold()
             self.hub.publish('hold', self.hold())
         found = re.search(r"extension '([^']+)'", message)
         self.change(item, status='failed', error=message, error_type=kind, auth_extension=found.group(1) if found else text(result, 'service'))
@@ -1084,21 +1362,79 @@ def check():
     assert lossless({'quality_options': [{'id': 'flac'}]}) and lossless({'quality_options': [{'id': 'best', 'kind': 'lossless'}]})
     assert not lossless({'quality_options': [{'id': 'AAC_320', 'kind': 'lossy'}]}) and not lossless({})
     assert 'downloadByStrategy' not in PASSTHROUGH and 'editFileMetadata' not in PASSTHROUGH   # those take server paths
+    assert seconds_left('2099-01-01T00:00:00.123Z') > 0 > seconds_left('2000-01-01T00:00:00Z') and seconds_left('') is None and seconds_left('2099-01-01T00:00:00') is None
+    signed = session_headers({'appVersion': 'a@1', 'schemeLabel': 'L', 'headerPrefix': 'X-T-'}, {'session_id': 's', 'session_secret': 'k'}, 'POST',
+                             'https://example.test/v2/session/refresh', b'{}', 1795309321123, 'n')
+    assert signed['X-T-Timestamp'] == '2026-11-22T01:02:01.123Z' and signed['X-T-Signature'] == '-nIEcpdIIxvIYiTI0Cek37MdFw3oRWrR8wpjiGwNnKs'   # what the backend's own signed_headers gives
     print('ok')
+
+
+def send_link(url, port, token):
+    """What Windows runs for a mornye:// link once --register-link has been used: the last step of a sign-in page
+    lands in the server already running on this machine, as it lands in the app."""
+    try:
+        if not url.lower().startswith('mornye://'):
+            raise ValueError('that is not a mornye:// link')
+        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=30)   # not urllib: a system proxy has no business here
+        connection.request('POST', '/api/call/queueExtensionCallbackUrl' + (f'?token={quote(token)}' if token else ''),
+                           json.dumps({'url': url}), {'Content-Type': 'application/json'})
+        if json.loads(connection.getresponse().read()).get('result') is not True:
+            raise ValueError('it was not taken as a sign-in link')
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        message = f'The sign-in link did not reach Mornye Web on port {port}: {error}'
+        if os.name == 'nt':   # pythonw has no console to say it in
+            ctypes.windll.user32.MessageBoxW(None, message, 'Mornye Web', 0x10)
+        sys.exit(message)
+
+
+def register_link(port):
+    # ponytail: for the default server, this machine only and no token. One reached with --token still takes the pasted link.
+    import winreg
+    runner = Path(sys.executable).with_name('pythonw.exe')   # no console window flashing by
+    command = f'"{runner if runner.exists() else sys.executable}" "{Path(__file__).resolve()}" --port {port} --link "%1"'
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r'Software\Classes\mornye') as key:
+        winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'URL:Mornye sign-in link')
+        winreg.SetValueEx(key, 'URL Protocol', 0, winreg.REG_SZ, '')
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r'Software\Classes\mornye\shell\open\command') as key:
+        winreg.SetValueEx(key, '', 0, winreg.REG_SZ, command)
+    print(f'mornye:// links now open with: {command}')
+
+
+def autostart(port, data):
+    # ponytail: as --register-link, for the default server: this machine only and no token.
+    import winreg
+    runner = Path(sys.executable).with_name('pythonw.exe')   # no console window: what it says goes to server.log in the data folder
+    command = f'"{runner if runner.exists() else sys.executable}" "{Path(__file__).resolve()}" --port {port} --data "{Path(data).resolve()}"'
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
+        winreg.SetValueEx(key, 'MornyeWeb', 0, winreg.REG_SZ, command)
+    print(f'Mornye Web now starts when you sign in to Windows, with: {command}\nTask Manager, Startup apps, turns it off again.')
 
 
 def main():
     parser = argparse.ArgumentParser(description='Mornye in the browser.')
+    parser.add_argument('--link', help='hand a mornye:// sign-in link to the server already running here, and exit')
+    parser.add_argument('--register-link', action='store_true', help='Windows: open mornye:// links with --link from now on, and exit')
     parser.add_argument('--host', default='127.0.0.1', help='address to listen on (default: this machine only)')
     parser.add_argument('--port', type=int, default=8377)
     parser.add_argument('--data', default=str(Path.home() / '.mornye-web'), help='where extensions, settings and history are kept')
     parser.add_argument('--token', default='', help='require this token (generated when listening beyond this machine and none is given)')
+    parser.add_argument('--autostart', action='store_true', help='Windows: start the server when you sign in from now on, and exit')
+    parser.add_argument('--no-auto-signin', action='store_true', help='do not open a sign-in page by itself when a service asks for one')
     parser.add_argument('--check', action='store_true', help='run the self-check and exit')
     args = parser.parse_args()
     if args.check:
         return check()
-    token = args.token or ('' if args.host in LOOPBACK else secrets.token_urlsafe(16))
-    app = App(args.data, find_library(), token)
+    if args.link:
+        return send_link(args.link, args.port, args.token)
+    if args.register_link:
+        return register_link(args.port)
+    if args.autostart:
+        return autostart(args.port, args.data)
+    if sys.stderr is None:   # pythonw, as --autostart runs it: no console, so what the server says is kept beside its data
+        Path(args.data).mkdir(parents=True, exist_ok=True)
+        sys.stdout = sys.stderr = open(Path(args.data) / 'server.log', 'a', encoding='utf-8', buffering=1)
+    token =args.token or ('' if args.host in LOOPBACK else secrets.token_urlsafe(16))
+    app = App(args.data, find_library(), token, not args.no_auto_signin)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads, server.app = True, app
     shown = '127.0.0.1' if args.host in ('0.0.0.0', '') else args.host

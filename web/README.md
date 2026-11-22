@@ -70,4 +70,30 @@ scanner and network storage, ReplayGain, automatic conversion to MP3/AAC/Opus, t
 post-processing hooks, the home feed, CSV/M3U import, custom folder templates, backup and restore.
 
 Signing in to a service finishes on a `mornye://` link, which only the installed app can open. Here the sign-in
-dialog asks you to paste that link back.
+dialog asks you to paste that link back. On Windows, run this once and the link goes to the running server by
+itself (it writes `HKCU\Software\Classes\mornye`; installing the app later takes the link over again):
+
+```
+python web/server.py --register-link
+```
+
+A queue that stopped to wait for a sign-in goes on by itself when one arrives.
+
+Staying signed in needs nobody:
+
+- a service's session lasts six hours, and the backend renews it only if a download happens to run in its last
+  hour. The server renews each one itself once it has under three hours left, with the session's own key and no
+  browser, so a queue left alone overnight is still signed in in the morning (the server's console says
+  `session renewed until …`);
+- a service that asks for a sign-in all the same (the server was off or the machine asleep for longer than a session
+  had left, or the service wants its check again) has its page opened on this machine by itself while songs wait,
+  one page at a time. With `--register-link` done the page's link comes back by itself, the queue goes on and the
+  next service is asked. On Windows with a Chromium browser as the default, the page gets a window of its own, which
+  the server closes again once the sign-in has arrived; elsewhere it is a tab, which stays. The page's check is the
+  browser's to pass: if it wants a click, that click is yours. A page nobody answers is tried again an hour later,
+  three times. `--no-auto-signin` turns the opening off. The console says `sign-in page opened` and `signed in` as
+  they happen.
+
+On Windows, `python web/server.py --autostart` makes the server start, with no window, each time you sign in (it
+writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; Task Manager's Startup apps turns it off). Started that
+way it has no console, and what it would say goes to `server.log` in its data folder.

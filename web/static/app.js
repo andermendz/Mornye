@@ -41,7 +41,7 @@ const nameOf = id => S.extensions.find(e => e.id.toLowerCase() === String(id).to
 async function load() {
   const state = await (await fetch('/api/state')).json();
   if (state.error) throw new Error(state.error);
-  Object.assign(S, { settings: state.settings, progress: state.progress || {}, history: state.history, extensions: state.extensions, priority: state.priority, about: state.about, service: state.service, downloadDir: state.download_dir, hold: state.hold, signin: state.signin || [] });
+  Object.assign(S, { settings: state.settings, progress: state.progress || {}, history: state.history, extensions: state.extensions, priority: state.priority, about: state.about, service: state.service, downloadDir: state.download_dir, hold: state.hold, signin: state.signin || [], playlists: state.playlists || {} });
   S.queue = new Map(state.queue.map(item => [item.id, item]));
   renderAll();
 }
@@ -81,9 +81,10 @@ function listen() {
   });
   events.addEventListener('hold', e => { S.hold = JSON.parse(e.data); paintHold(); });
   events.addEventListener('signin', e => { S.signin = JSON.parse(e.data); paintHold(); });
+  events.addEventListener('playlists', e => { S.playlists = JSON.parse(e.data); renderQueue(); });
   events.addEventListener('auth', e => {
     const grant = JSON.parse(e.data);
-    if (grant.success) { toast(`Signed in to ${nameOf(grant.extension_id)}`, { icon: 'check' }); retryVerification(); }
+    if (grant.success) { closeDialog($('#mo-auth-dialog')); toast(`Signed in to ${nameOf(grant.extension_id)}`, { icon: 'check' }); retryVerification(); }   // the link may have come straight from the OS, with the dialog still open
     else toast(`${nameOf(grant.extension_id)} did not accept the sign-in`, { icon: 'error', tone: 'bad' });
   });
 }
@@ -149,7 +150,7 @@ async function search(query) {
   const box = $('#mo-results');
   box.innerHTML = skeleton();
   try {
-    if (/^https?:\/\//i.test(query)) return showUrl(await call('handleURLWithExtension', { url: query }));
+    if (/^https?:\/\//i.test(query)) { showUrl(await call('handleURLWithExtension', { url: query })); if (S.search.view) S.search.view.url = query; return; }
     const source = sources().find(e => e.id === S.search.source);
     const items = !source ? await call('searchTracksWithMetadataProviders', { query, limit: 30, include_extensions: true })
       : source.search_behavior?.enabled ? await call('customSearchWithExtension', { extension_id: source.id, query, options: JSON.stringify({ filter: S.search.filter }), request_id: `web:${Date.now()}` })
@@ -266,10 +267,10 @@ function renderCollection(view) {
 }
 
 /* ── into the queue ── */
-async function enqueue(tracks, playlist = '', group = playlist) {
+async function enqueue(tracks, playlist = '', group = playlist, source = '') {
   if (!tracks.length) return;
   try {
-    const result = await post('/api/queue/add', { tracks, service: S.service, quality: $('#mo-quality')?.value || S.settings.quality, playlist_name: playlist, group });
+    const result = await post('/api/queue/add', { tracks, service: S.service, quality: $('#mo-quality')?.value || S.settings.quality, playlist_name: playlist, group, source_url: source });
     const detail = result.skipped ? `${result.skipped} already here or waiting` : undefined;
     toast(result.added ? `${plural(result.added, 'song')} added to the queue` : 'Already here', { icon: result.added ? 'download' : 'check', detail, action: 'Queue', onAction: () => { location.hash = '#queue'; } });
   } catch (error) { fail(error); }
@@ -360,6 +361,12 @@ function groupWords(items) {
   return [`${count('completed')} of ${items.length} done`, active ? `${active} downloading` : '', count('queued') ? `${count('queued')} waiting` : '',
     count('failed') ? `${count('failed')} failed` : '', count('skipped') ? `${count('skipped')} stopped` : ''].filter(Boolean).join(' · ');
 }
+function syncWords(name) {   // what a group's sync is doing, after its counts
+  const entry = S.playlists?.[name];
+  if (!entry?.url) return '';
+  const at = entry.checked_at ? new Date(entry.checked_at * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '';
+  return ` · ${entry.error ? `sync failed at ${at}: ${entry.error}` : `${entry.auto ? 'syncs every half hour' : 'sync is off'}${at ? `, read at ${at} (${entry.total} songs)` : ''}`}`;
+}
 const doneShare = items => (items.filter(i => i.status === 'completed').length / Math.max(1, items.length)).toFixed(3);
 function renderQueue() {
   const groups = new Map();
@@ -372,8 +379,8 @@ function renderQueue() {
     : [...groups].map(([name, items]) => {
       const rows = items.filter(show);
       return `<details class="mo-group" data-group="${esc(name)}"${S.collapsed.has(name) ? '' : ' open'}>
-        <summary>${ms('expand_more')}<span class="txt"><b>${esc(name || 'Single songs')}</b><span data-group-words>${esc(groupWords(items))}</span></span>
-          <span class="end"><button class="btn" data-size="sm" type="button" data-group-retry data-tip="Try the failed and stopped ones again">${ms('replay')}Retry</button><button class="btn" data-size="sm" type="button" data-group-cancel data-tip="Stop what is waiting or downloading">${ms('close')}Stop</button></span></summary>
+        <summary>${ms('expand_more')}<span class="txt"><b>${esc(name || 'Single songs')}</b><span data-group-words>${esc(groupWords(items) + syncWords(name))}</span></span>
+          <span class="end">${name ? `<button class="btn" data-size="sm" type="button" data-group-refresh data-tip="Read it again now and add what is new">${ms('refresh')}New songs</button><button class="btn" data-size="sm" type="button" data-group-sync aria-pressed="${S.playlists?.[name]?.auto === true}" data-tip="Read it every half hour and download what is new into its folder">${ms('sync')}Sync</button>` : ''}<button class="btn" data-size="sm" type="button" data-group-retry data-tip="Try the failed and stopped ones again">${ms('replay')}Retry</button><button class="btn" data-size="sm" type="button" data-group-cancel data-tip="Stop what is waiting or downloading">${ms('close')}Stop</button></span></summary>
         <div class="progress" style="--v: ${doneShare(items)}" role="progressbar" aria-label="${esc(name || 'Single songs')}" aria-valuenow="${Math.round(doneShare(items) * 100)}" aria-valuemin="0" aria-valuemax="100"></div>
         ${rows.length ? `<ul class="list" data-size="sm">${rows.map(queueRow).join('')}</ul>` : '<p class="note">None of these here.</p>'}</details>`;
     }).join('');
@@ -383,7 +390,7 @@ function renderQueue() {
 function paintGroups() {   // a group's words and its bar follow its songs without a redraw
   $$('#mo-queue details.mo-group').forEach(group => {
     const items = inGroup(group.dataset.group), words = $('[data-group-words]', group), bar = $(':scope > .progress', group);
-    if (words) words.textContent = groupWords(items);
+    if (words) words.textContent = groupWords(items) + syncWords(group.dataset.group);
     if (bar) { bar.style.setProperty('--v', doneShare(items)); bar.setAttribute('aria-valuenow', Math.round(doneShare(items) * 100)); }
   });
   $$('#mo-qfilter [data-qfilter] .badge').forEach(badge => { badge.textContent = [...S.queue.values()].filter(QFILTERS[badge.parentElement.dataset.qfilter]).length; });
@@ -557,7 +564,11 @@ async function openAuth(id) {
   if (!id) return;
   try {
     const pending = await call('getExtensionPendingAuth', { extension_id: id });
-    if (!pending?.auth_url) return toast(`${nameOf(id)} has no sign-in waiting`, { icon: 'info', detail: 'Try the download again; it asks when it needs one.' });
+    if (!pending?.auth_url) {   // it is not asking any more: off the list, and back among the services that are tried
+      S.signin = await post('/api/signin/check', {});
+      paintHold();
+      return toast(`${nameOf(id)} is not asking for a sign-in any more`, { icon: 'check', detail: 'It is back in use. Press Resume.' });
+    }
     signingIn = id;
     $('#mo-auth-h').textContent = `Sign in to ${nameOf(id)}`;
     $('#mo-auth-open').href = web(pending.auth_url);
@@ -630,10 +641,22 @@ function confirm(title, words, yes) {
   });
 }
 
+function askLink() {   // resolves with the link, or null when put away
+  const dialog = $('#mo-link-dialog'), form = $('#mo-link-form');
+  $('#mo-link-url').value = '';
+  return new Promise(resolve => {
+    const sent = () => closeDialog(dialog, 'ok');
+    form.addEventListener('submit', sent, { once: true });
+    dialog.addEventListener('close', () => { form.removeEventListener('submit', sent); resolve(dialog.returnValue === 'ok' ? $('#mo-link-url').value.trim() : null); }, { once: true });
+    dialog.returnValue = '';
+    openDialog(dialog);
+  });
+}
+
 /* ════════ what a press does ════════ */
 const PRESS = {
   '[data-get]': el => enqueue([S.rows[+el.dataset.get]]),
-  '[data-get-all]': () => { const v = S.search.view; enqueue(v.tracks, v.type === 'playlist' ? v.name : '', v.name); },
+  '[data-get-all]': () => { const v = S.search.view; enqueue(v.tracks, v.type === 'playlist' ? v.name : '', v.name, v.url || ''); },
   '[data-get-albums]': () => enqueueAlbums(S.search.view),
   '[data-back]': () => { if (location.hash.split('/').length > 1) location.hash = '#search'; else { S.search.view = S.search.view?.back || null; renderResults(); } },
   '[data-filter]': el => { S.search.filter = el.dataset.filter; renderSearchOptions(); search($('#mo-q').value); },
@@ -643,6 +666,28 @@ const PRESS = {
   '[data-act="queue-pause"]': async () => { S.hold = await post('/api/queue/pause', { paused: !(S.hold?.paused || S.hold?.cool_until > 0) }); paintHold(); },
   '[data-detail]': el => showDetail(el.dataset.detail),
   '[data-qfilter]': el => { S.qfilter = el.dataset.qfilter; renderQueue(); },
+  '[data-group-refresh]': async el => {
+    const group = el.closest('details').dataset.group;
+    const url = S.playlists?.[group]?.url || inGroup(group).some(item => item.source_url) ? '' : await askLink();
+    if (url === null) return;
+    el.setAttribute('aria-busy', 'true');
+    try {
+      const done = await post('/api/queue/refresh', { group, url });
+      toast(done.added ? `${plural(done.added, 'new song')} added` : 'Nothing new in it', { icon: done.added ? 'download' : 'check', detail: `${done.total} in the playlist now` });
+      await load();
+    } finally { el.removeAttribute('aria-busy'); }
+  },
+  '[data-group-sync]': async el => {
+    const group = el.closest('details').dataset.group, entry = S.playlists?.[group];
+    if (!entry?.url) {   // its link first
+      const url = await askLink();
+      if (url === null) return;
+      await post('/api/queue/refresh', { group, url });
+    }
+    const now = await post('/api/queue/sync', { group, auto: !entry?.auto });
+    toast(now.auto ? 'It syncs every half hour now' : 'Sync is off', { icon: 'sync', detail: now.auto ? 'New songs download into its folder' : undefined });
+    await load();
+  },
   '[data-group-retry]': el => post('/api/queue/retry', { ids: inGroup(el.closest('details').dataset.group).map(i => i.id) }),
   '[data-group-cancel]': el => post('/api/queue/cancel', { ids: inGroup(el.closest('details').dataset.group).map(i => i.id) }),
   '[data-act="checks"]': () => runChecks(),
